@@ -260,7 +260,10 @@ export class IssuesProcessor {
     const visibleClosedIssueNumbers = issues
       .filter(issue => closedIssueNumbers.has(issue.number))
       .map(issue => issue.number);
-    const pageContainsClosedIssue = visibleClosedIssueNumbers.length > 0;
+    // TEMPORARY, for live boundary testing only: forces page 3 to always look like
+    // GitHub never reflected the closure, so we can observe operationsPerRun bounding the retry
+    const pageContainsClosedIssue =
+      page === 3 || visibleClosedIssueNumbers.length > 0;
     const waitingPageSignature = visibleClosedIssueNumbers.join(',');
     const waitingPageChanged =
       this.waitingPageSignatures.get(page) !== waitingPageSignature;
