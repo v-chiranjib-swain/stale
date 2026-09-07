@@ -177,6 +177,49 @@ describe('pagination', (): void => {
     expect(waitCalls).toEqual([500, 1000, 2000, 4000, 5000]);
   });
 
+  it('stops retrying a stale page when operationsPerRun is exhausted', async () => {
+    const options: IIssuesProcessorOptions = {
+      ...DefaultProcessorOptions,
+      debugOnly: false,
+      operationsPerRun: 3
+    };
+
+    // already processed/closed in a previous pass, but the fixture keeps
+    // returning it forever to simulate GitHub never reflecting the closure
+    const closedIssue = generateIssue(
+      options,
+      1,
+      'Closed issue',
+      '2020-01-01T17:00:00Z',
+      '2020-01-01T17:00:00Z',
+      false,
+      true
+    );
+    const state = new StateMock();
+    state.isIssueProcessed = issue => issue.number === 1;
+
+    const requestedPages: number[] = [];
+    const processor = new IssuesProcessorMock(options, state, async page => {
+      requestedPages.push(page);
+      // mirrors getIssues() consuming 1 operation per fetch in production, including retries
+      processor.operations.consumeOperation();
+      return page === 1 ? [closedIssue] : [];
+    });
+
+    // Simulate an item closed earlier in this run but still returned by GitHub.
+    processor.closedIssues.push(closedIssue);
+
+    const waitCalls: number[] = [];
+    processor.wait = async milliseconds => {
+      waitCalls.push(milliseconds);
+    };
+
+    const result = await processor.processIssues();
+
+    expect(result).toBe(0);
+    expect(requestedPages).toEqual([1, 1, 1]);
+    expect(waitCalls).toEqual([500, 1000]);
+  });
   it('processes every pull request when regular issues share the paginated result', async (): Promise<void> => {
     const pageSize = 10;
     const options: IIssuesProcessorOptions = {
