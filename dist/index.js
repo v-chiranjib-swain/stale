@@ -51706,9 +51706,9 @@ class IssuesProcessor {
         const visibleClosedIssueNumbers = issues
             .filter(issue => closedIssueNumbers.has(issue.number))
             .map(issue => issue.number);
-        // TEMPORARY, for live boundary testing only: forces page 3 to always look like
+        // TEMPORARY, for live boundary testing only: forces page 1 to always look like
         // GitHub never reflected the closure, so we can observe operationsPerRun bounding the retry
-        const pageContainsClosedIssue = page === 3 || visibleClosedIssueNumbers.length > 0;
+        const pageContainsClosedIssue = page === 1 || visibleClosedIssueNumbers.length > 0;
         const waitingPageSignature = visibleClosedIssueNumbers.join(',');
         const waitingPageChanged = this.waitingPageSignatures.get(page) !== waitingPageSignature;
         this.waitingPageSignatures.set(page, waitingPageSignature);
