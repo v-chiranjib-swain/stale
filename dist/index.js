@@ -51602,6 +51602,10 @@ class IssuesProcessor {
     statistics;
     _logger = new Logger();
     state;
+    pageSignatures = new Map();
+    pagePasses = new Map();
+    waitingPageSignatures = new Map();
+    firstPassFetchCounts = new Map();
     constructor(options, state) {
         this.options = options;
         this.state = state;
@@ -51616,33 +51620,71 @@ class IssuesProcessor {
             this.statistics = new Statistics();
         }
     }
+    // overridable so tests don't incur real delays
+    async wait(milliseconds) {
+        return new Promise(resolve => setTimeout(resolve, milliseconds));
+    }
     async processIssues(page = 1) {
-        // get the next batch of issues
         const issues = await this.getIssues(page);
+        const pageSignature = issues.map(issue => issue.number).join(',');
+        if (this.options.debugOnly &&
+            this.pageSignatures.get(page) === pageSignature) {
+            return this.processIssues(page + 1);
+        }
+        this.pageSignatures.set(page, pageSignature);
+        const pagePass = (this.pagePasses.get(page) ?? 0) + 1;
+        this.pagePasses.set(page, pagePass);
         if (issues.length <= 0) {
             this._logger.info(LoggerService.green(`No more issues found to process. Exiting...`));
             this.statistics
                 ?.setOperationsCount(this.operations.getConsumedOperationsCount())
                 .logStats();
             this.state.reset();
+            this.pageSignatures.clear();
+            this.pagePasses.clear();
+            this.waitingPageSignatures.clear();
+            this.firstPassFetchCounts.clear();
             return this.operations.getRemainingOperationsCount();
         }
-        else {
-            this._logger.info(`${LoggerService.yellow('Processing the batch of issues ')} ${LoggerService.cyan(`#${page}`)} ${LoggerService.yellow(' containing ')} ${LoggerService.cyan(issues.length)} ${LoggerService.yellow(` issue${issues.length > 1 ? 's' : ''}...`)}`);
+        if (pagePass === 1) {
+            this.firstPassFetchCounts.set(page, issues.length);
+        }
+        const fetchCountShrank = issues.length < (this.firstPassFetchCounts.get(page) ?? issues.length);
+        const unprocessedIssues = [];
+        const previouslyProcessedIssues = [];
+        for (const issue of issues) {
+            if (this.state.isIssueProcessed(issue)) {
+                previouslyProcessedIssues.push(issue);
+            }
+            else {
+                unprocessedIssues.push(issue);
+            }
+        }
+        // A previous-run skip is only detectable on a page's first fetch this run;
+        // later passes re-see the same items because we're waiting on GitHub, not because of restored state.
+        // silent retries (no new items, not the first fetch) stay fully quiet to avoid no-op noise
+        const isVisiblePass = unprocessedIssues.length > 0 || pagePass === 1;
+        if (isVisiblePass) {
+            this._logger.info(`${LoggerService.yellow('Processing page ')} ${LoggerService.cyan(`#${page}`)} ${LoggerService.yellow(': ')} ${LoggerService.cyan(unprocessedIssues.length)} ${LoggerService.yellow(`new item${unprocessedIssues.length === 1 ? '' : 's'} out of `)} ${LoggerService.cyan(issues.length)} ${LoggerService.yellow(`fetched (${previouslyProcessedIssues.length} previously processed)...`)}`);
+            if (fetchCountShrank) {
+                this._logger.info(`${LoggerService.green('Page ')} ${LoggerService.cyan(`#${page}`)} ${LoggerService.green(' shrank as GitHub reflected the closures.')}`);
+            }
+        }
+        if (pagePass === 1) {
+            for (const issue of previouslyProcessedIssues) {
+                const issueLogger = new IssueLogger(issue);
+                issueLogger.info('           $$type skipped due being processed during the previous run');
+            }
         }
         const labelsToRemoveWhenStale = wordsToList(this.options.labelsToRemoveWhenStale);
         const labelsToAddWhenUnstale = wordsToList(this.options.labelsToAddWhenUnstale);
         const labelsToRemoveWhenUnstale = wordsToList(this.options.labelsToRemoveWhenUnstale);
-        for (const issue of issues.values()) {
-            // Stop the processing if no more operations remains
+        const closedItemsCountBeforePass = this.closedIssues.length;
+        for (const issue of unprocessedIssues.values()) {
             if (!this.operations.hasRemainingOperations()) {
                 break;
             }
             const issueLogger = new IssueLogger(issue);
-            if (this.state.isIssueProcessed(issue)) {
-                issueLogger.info('           $$type skipped due being processed during the previous run');
-                continue;
-            }
             await issueLogger.grouping(`$$type #${issue.number}`, async () => {
                 await this.processIssue(issue, labelsToAddWhenUnstale, labelsToRemoveWhenUnstale, labelsToRemoveWhenStale);
             });
@@ -51656,9 +51698,31 @@ class IssuesProcessor {
                 .logStats();
             return 0;
         }
-        this._logger.info(`${LoggerService.green('Batch ')} ${LoggerService.cyan(`#${page}`)} ${LoggerService.green(' processed.')}`);
-        // Do the next batch
-        return this.processIssues(page + 1);
+        if (isVisiblePass) {
+            this._logger.info(`${LoggerService.green('Page ')} ${LoggerService.cyan(`#${page}`)} ${LoggerService.green(' processed.')}`);
+        }
+        const closedItemsCount = this.closedIssues.length - closedItemsCountBeforePass;
+        const closedIssueNumbers = new Set(this.closedIssues.map(issue => issue.number));
+        const visibleClosedIssueNumbers = issues
+            .filter(issue => closedIssueNumbers.has(issue.number))
+            .map(issue => issue.number);
+        const pageContainsClosedIssue = visibleClosedIssueNumbers.length > 0;
+        const waitingPageSignature = visibleClosedIssueNumbers.join(',');
+        const waitingPageChanged = this.waitingPageSignatures.get(page) !== waitingPageSignature;
+        this.waitingPageSignatures.set(page, waitingPageSignature);
+        const backoffMilliseconds = Math.min(500 * 2 ** (pagePass - 1), 5000);
+        if (pageContainsClosedIssue &&
+            (closedItemsCount > 0 || waitingPageChanged)) {
+            this._logger.info(`${LoggerService.yellow(`${visibleClosedIssueNumbers.length} previously closed item${visibleClosedIssueNumbers.length === 1 ? '' : 's'} still visible on page `)} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow(`. Waiting ${backoffMilliseconds}ms for GitHub to catch up with closures.`)}`);
+        }
+        if (pageContainsClosedIssue) {
+            await this.wait(backoffMilliseconds);
+        }
+        if (!pageContainsClosedIssue) {
+            this.waitingPageSignatures.delete(page);
+            this._logger.info(`${LoggerService.green('Page ')} ${LoggerService.cyan(`#${page}`)} ${LoggerService.green(' is stable. Advancing to page ')} ${LoggerService.cyan(`#${page + 1}`)}${LoggerService.green('.')}`);
+        }
+        return this.processIssues(pageContainsClosedIssue ? page : page + 1);
     }
     async processIssue(issue, labelsToAddWhenUnstale, labelsToRemoveWhenUnstale, labelsToRemoveWhenStale) {
         this.statistics?.incrementProcessedItemsCount(issue);
@@ -52105,7 +52169,6 @@ class IssuesProcessor {
     async _closeIssue(issue, closeMessage, closeLabel) {
         const issueLogger = new IssueLogger(issue);
         issueLogger.info(`Closing $$type for being stale`);
-        this.closedIssues.push(issue);
         if (closeMessage) {
             try {
                 this._consumeIssueOperation(issue);
@@ -52143,7 +52206,6 @@ class IssuesProcessor {
         }
         try {
             this._consumeIssueOperation(issue);
-            this.statistics?.incrementClosedItemsCount(issue);
             if (!this.options.debugOnly) {
                 await this.client.rest.issues.update({
                     owner: github_context.repo.owner,
@@ -52153,6 +52215,8 @@ class IssuesProcessor {
                     state_reason: (this.options.closeIssueReason || undefined)
                 });
             }
+            this.closedIssues.push(issue);
+            this.statistics?.incrementClosedItemsCount(issue);
         }
         catch (error) {
             issueLogger.error(`Error when updating this $$type: ${error.message}`);
