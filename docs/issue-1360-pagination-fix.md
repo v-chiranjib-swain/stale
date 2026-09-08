@@ -387,7 +387,54 @@ of re-skipping or double-processing anything.
 
 ---
 
-## 8. Conclusion
+## 8. PR Review: Operations-Budget Boundary (Copilot)
+
+GitHub's automated PR reviewer flagged a concern on
+[PR #25](https://github.com/v-chiranjib-swain/stale/pull/25): `processIssues()` could
+retry a page indefinitely if it keeps showing an already-closed item with nothing new
+to process, since `operations-per-run` might never be consulted in that path.
+
+**Investigation:** traced into `getIssues()` and found it unconditionally consumes 1
+operation on *every* fetch, including same-page retries:
+
+```ts
+async getIssues(page: number): Promise<Issue[]> {
+  try {
+    this.operations.consumeOperation();   // charged on every call, retry or not
+    const issueResult = await this.client.rest.issues.listForRepo({...});
+```
+
+Since every recursive call to `processIssues()` starts with `await this.getIssues(page)`,
+the existing post-loop `hasRemainingOperations()` check (which runs unconditionally,
+regardless of how many items were actually processed) will always eventually catch a
+stuck page and exit via the existing `No more operations left! Exiting...` path.
+**Conclusion: no code change was needed** — the retry loop was already bounded.
+
+**Verified two ways:**
+
+1. **Regression test** (`__tests__/pagination.spec.ts`) simulating a page that never
+   stops showing an already-closed item, with `operationsPerRun: 3`. The existing,
+   unmodified code exits cleanly after exactly 3 fetches.
+2. **Live test** against `v-chiranjib-swain/labeler-test`, using a temporary,
+   throwaway-branch-only hack (`experiment/boundary-test-1360`, never merged) that
+   forced page 1 to *never* stabilize — a worse case than could occur naturally. With
+   `operations-per-run: 40`, the action retried silently with growing backoff
+   (`500ms → 1000ms → 2000ms → ... → capped 5000ms`) for ~165 seconds, then exited
+   cleanly via the same warning once the budget was exhausted. State persisted
+   correctly (32 issues cached) for the next run to resume.
+   - Run: https://github.com/v-chiranjib-swain/labeler-test/actions/runs/34092735309
+
+**Side-finding:** the live test's `Fetched items: 1020` statistic looked surprising at
+first, but is fully explained: each retry against the stuck page makes a *real* GitHub
+API call (since `getIssues()` always performs the actual fetch), and ~34 retries ×
+~30 items per fetch ≈ 1020. This confirms a stuck page costs one real API call per
+retry — harmless under normal operation (real eventual-consistency delays resolve in
+seconds), but worth being aware of as a minor rate-limit consideration in extreme
+cases. Not significant enough to warrant a README change; captured here instead.
+
+---
+
+## 9. Conclusion
 
 - No eligible PR was skipped in any live test, across three different closure
   positions (page 1, page 3, and a full-list closure scenario).
@@ -397,6 +444,9 @@ of re-skipping or double-processing anything.
   (verified against both `main` and the fixed branch — see §6.5).
 - Logs are accurate, non-noisy, and self-explanatory for every scenario tested: stable
   pages, same-page retries, shrinking pages, and cross-run resumption.
+- A PR review concern about an unbounded retry loop was investigated, confirmed to be
+  a non-issue (the existing `operations-per-run` accounting already bounds it), and
+  backed by both a new regression test and a live worst-case validation (see §8).
 - All 30 local test suites (1364 tests) pass; format, lint, and build are clean at the
   final commit.
 
