@@ -62,6 +62,7 @@ describe('pagination', (): void => {
     const pageSize = 10;
     const options: IIssuesProcessorOptions = {
       ...DefaultProcessorOptions,
+      debugOnly: false,
       operationsPerRun: 100
     };
     const initiallyOpenPullRequests = Array.from(
@@ -281,5 +282,270 @@ describe('pagination', (): void => {
     expect(processor.closedIssues.map(issue => issue.number)).toEqual(
       pullRequests.map(issue => issue.number)
     );
+  });
+
+  it('does not skip items when stale comments reorder the comments-sorted list', async (): Promise<void> => {
+    const pageSize = 5;
+    const options: IIssuesProcessorOptions = {
+      ...DefaultProcessorOptions,
+      sortBy: 'comments',
+      ascending: true,
+      debugOnly: false,
+      operationsPerRun: 100
+    };
+
+    const allIssues: Issue[] = Array.from({length: 10}, (_, index): Issue =>
+      generateIssue(
+        options,
+        index + 1,
+        `Pull request #${index + 1}`,
+        '2020-01-01T17:00:00Z',
+        '2020-01-01T17:00:00Z',
+        false,
+        true
+      )
+    );
+
+    // Initial ordering:
+    // Page 1: #1, #2, #3, #4, #5
+    // Page 2: #6, #7, #8, #9, #10
+    //
+    // Adding a comment to #1-#5 increases their comment count and
+    // causes the list to be re-sorted on subsequent fetches. This
+    // simulates an item from page 2 moving into the already visited page 1.
+    const commentCounts = new Map<number, number>(
+      allIssues.map(issue => [issue.number, issue.number])
+    );
+
+    const inspectedNumbers: number[] = [];
+    const requestedPages: number[] = [];
+    const processedNumbers = new Set<number>();
+
+    const state = new StateMock();
+    state.addIssueToProcessed = issue => {
+      processedNumbers.add(issue.number);
+    };
+    state.isIssueProcessed = issue => processedNumbers.has(issue.number);
+
+    const processor = new IssuesProcessorMock(options, state, async page => {
+      requestedPages.push(page);
+
+      const sorted = [...allIssues].sort((a, b) => {
+        const diff =
+          (commentCounts.get(a.number) ?? 0) -
+          (commentCounts.get(b.number) ?? 0);
+
+        return diff !== 0 ? diff : a.number - b.number;
+      });
+
+      const pageStart = (page - 1) * pageSize;
+      return sorted.slice(pageStart, pageStart + pageSize);
+    });
+
+    processor.processIssue = async issue => {
+      inspectedNumbers.push(issue.number);
+
+      // Simulate marking the item stale by adding a comment.
+      // The issue remains open; nothing is added to closedIssues.
+      if (issue.number <= 5) {
+        commentCounts.set(
+          issue.number,
+          (commentCounts.get(issue.number) ?? 0) + 10
+        );
+      }
+    };
+
+    await processor.processIssues();
+
+    // Every issue must be inspected despite the ordering changing
+    // between page fetches.
+    expect(inspectedNumbers.slice().sort((a, b) => a - b)).toEqual(
+      allIssues.map(issue => issue.number)
+    );
+
+    // This scenario must not be caused by closure detection.
+    expect(processor.closedIssues).toHaveLength(0);
+
+    // Page 1 must be revisited if the ordering mutation is detected.
+    expect(requestedPages.filter(page => page === 1).length).toBeGreaterThan(1);
+  });
+
+  it('processes items shifted into an earlier page by comment-based reordering', async (): Promise<void> => {
+    const pageSize = 5;
+
+    const options: IIssuesProcessorOptions = {
+      ...DefaultProcessorOptions,
+      sortBy: 'comments',
+      ascending: true,
+      debugOnly: false,
+      operationsPerRun: 100
+    };
+
+    const allIssues: Issue[] = Array.from({length: 10}, (_, index): Issue =>
+      generateIssue(
+        options,
+        index + 1,
+        `Pull request #${index + 1}`,
+        '2020-01-01T17:00:00Z',
+        '2020-01-01T17:00:00Z',
+        false,
+        true
+      )
+    );
+
+    // Initial ordering:
+    // Page 1 -> #1(0) #2(0) #3(0) #4(1) #5(1)
+    // Page 2 -> #6(1) #7(2) #8(3) #9(4) #10(5)
+    const commentCounts = new Map<number, number>([
+      [1, 0],
+      [2, 0],
+      [3, 0],
+      [4, 1],
+      [5, 1],
+      [6, 1],
+      [7, 2],
+      [8, 3],
+      [9, 4],
+      [10, 5]
+    ]);
+
+    const inspectedNumbers: number[] = [];
+    const requestedPages: number[] = [];
+
+    const state = new StateMock();
+    const processedNumbers = new Set<number>();
+
+    state.addIssueToProcessed = issue => {
+      processedNumbers.add(issue.number);
+    };
+
+    state.isIssueProcessed = issue => processedNumbers.has(issue.number);
+
+    const processor = new IssuesProcessorMock(options, state, async page => {
+      requestedPages.push(page);
+
+      const sorted = [...allIssues].sort((a, b) => {
+        const diff =
+          (commentCounts.get(a.number) ?? 0) -
+          (commentCounts.get(b.number) ?? 0);
+
+        return diff !== 0 ? diff : a.number - b.number;
+      });
+
+      const pageStart = (page - 1) * pageSize;
+
+      return sorted.slice(pageStart, pageStart + pageSize);
+    });
+
+    processor.processIssue = async issue => {
+      inspectedNumbers.push(issue.number);
+
+      // Simulate marking #4 and #5 stale by adding a comment.
+      if (issue.number === 4 || issue.number === 5) {
+        commentCounts.set(
+          issue.number,
+          (commentCounts.get(issue.number) ?? 0) + 1
+        );
+      }
+    };
+
+    await processor.processIssues();
+
+    // After processing Page 1:
+    // Page 1 -> #1(0) #2(0) #3(0) #6(1) #7(2)
+    //                         ↑       ↑
+    //                     moved from Page 2
+
+    expect(inspectedNumbers.slice().sort((a, b) => a - b)).toEqual(
+      allIssues.map(issue => issue.number)
+    );
+
+    expect(requestedPages).toContain(1);
+    expect(requestedPages).toContain(2);
+
+    // No item was closed; the ordering changed only because comments changed.
+    expect(processor.closedIssues).toHaveLength(0);
+  });
+
+  it('does not skip items when marking stale changes the updated-sorted list', async (): Promise<void> => {
+    const pageSize = 5;
+    const options: IIssuesProcessorOptions = {
+      ...DefaultProcessorOptions,
+      sortBy: 'updated',
+      ascending: true,
+      debugOnly: false,
+      operationsPerRun: 100
+    };
+
+    const allIssues: Issue[] = Array.from({length: 10}, (_, index): Issue =>
+      generateIssue(
+        options,
+        index + 1,
+        `Pull request #${index + 1}`,
+        '2020-01-01T17:00:00Z',
+        '2020-01-01T17:00:00Z',
+        false,
+        true
+      )
+    );
+
+    // Initial ordering (oldest updated first, ascending):
+    // Page 1: #1, #2, #3, #4, #5
+    // Page 2: #6, #7, #8, #9, #10
+    //
+    // Marking #1-#5 stale bumps their updated_at to "now" (real _markStale()
+    // does exactly this), pushing them to the very end of the ascending
+    // ordering. This simulates items from page 2 shifting into page 1.
+    const updatedRank = new Map<number, number>(
+      allIssues.map(issue => [issue.number, issue.number])
+    );
+
+    const inspectedNumbers: number[] = [];
+    const requestedPages: number[] = [];
+    const processedNumbers = new Set<number>();
+
+    const state = new StateMock();
+    state.addIssueToProcessed = issue => {
+      processedNumbers.add(issue.number);
+    };
+    state.isIssueProcessed = issue => processedNumbers.has(issue.number);
+
+    const processor = new IssuesProcessorMock(options, state, async page => {
+      requestedPages.push(page);
+
+      const sorted = [...allIssues].sort((a, b) => {
+        const diff =
+          (updatedRank.get(a.number) ?? 0) - (updatedRank.get(b.number) ?? 0);
+
+        return diff !== 0 ? diff : a.number - b.number;
+      });
+
+      const pageStart = (page - 1) * pageSize;
+      return sorted.slice(pageStart, pageStart + pageSize);
+    });
+
+    processor.processIssue = async issue => {
+      inspectedNumbers.push(issue.number);
+
+      // Simulate marking the item stale, bumping its updated_at to "now".
+      // The issue remains open; nothing is added to closedIssues.
+      if (issue.number <= 5) {
+        updatedRank.set(issue.number, issue.number + 100);
+      }
+    };
+
+    await processor.processIssues();
+
+    // Every issue must be inspected despite the ordering changing
+    // between page fetches.
+    expect(inspectedNumbers.slice().sort((a, b) => a - b)).toEqual(
+      allIssues.map(issue => issue.number)
+    );
+
+    // This scenario must not be caused by closure detection.
+    expect(processor.closedIssues).toHaveLength(0);
+
+    // Page 1 must be revisited if the ordering mutation is detected.
+    expect(requestedPages.filter(page => page === 1).length).toBeGreaterThan(1);
   });
 });

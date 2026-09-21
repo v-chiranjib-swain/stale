@@ -261,6 +261,14 @@ export class IssuesProcessor {
       .filter(issue => closedIssueNumbers.has(issue.number))
       .map(issue => issue.number);
     const pageContainsClosedIssue = visibleClosedIssueNumbers.length > 0;
+    // sort-by "updated"/"comments" can reorder the collection when a stale
+    // comment/label mutation is applied, even though nothing closed; re-check
+    // this page once more before advancing so shifted items aren't skipped
+    const sortKeyIsMutable =
+      this.options.sortBy === 'updated' || this.options.sortBy === 'comments';
+    const pageMayHaveReordered =
+      sortKeyIsMutable && unprocessedIssues.length > 0;
+    const pageIsUnstable = pageContainsClosedIssue || pageMayHaveReordered;
     const waitingPageSignature = visibleClosedIssueNumbers.join(',');
     const waitingPageChanged =
       this.waitingPageSignatures.get(page) !== waitingPageSignature;
@@ -281,13 +289,21 @@ export class IssuesProcessor {
           `. Waiting ${backoffMilliseconds}ms for GitHub to catch up with closures.`
         )}`
       );
+    } else if (pageMayHaveReordered) {
+      this._logger.info(
+        `${LoggerService.yellow(
+          'Items were just processed on page '
+        )} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow(
+          `, which can reorder results when sorting by "${this.options.sortBy}". Waiting ${backoffMilliseconds}ms to re-check this page.`
+        )}`
+      );
     }
 
-    if (pageContainsClosedIssue) {
+    if (pageIsUnstable && !this.options.debugOnly) {
       await this.wait(backoffMilliseconds);
     }
 
-    if (!pageContainsClosedIssue) {
+    if (!pageIsUnstable) {
       this.waitingPageSignatures.delete(page);
       this._logger.info(
         `${LoggerService.green('Page ')} ${LoggerService.cyan(
@@ -298,7 +314,7 @@ export class IssuesProcessor {
       );
     }
 
-    return this.processIssues(pageContainsClosedIssue ? page : page + 1);
+    return this.processIssues(pageIsUnstable ? page : page + 1);
   }
 
   async processIssue(
