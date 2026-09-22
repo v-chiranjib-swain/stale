@@ -51894,12 +51894,13 @@ class IssuesProcessor {
     }
     async processIssues(page = 1) {
         const issues = await this.getIssues(page);
-        const pageSignature = issues.map(issue => issue.number).join(',');
-        if (this.options.debugOnly &&
-            this.pageSignatures.get(page) === pageSignature) {
-            return this.processIssues(page + 1);
+        if (this.options.debugOnly) {
+            const pageSignature = issues.map(issue => issue.number).join(',');
+            if (this.pageSignatures.get(page) === pageSignature) {
+                return this.processIssues(page + 1);
+            }
+            this.pageSignatures.set(page, pageSignature);
         }
-        this.pageSignatures.set(page, pageSignature);
         const pagePass = (this.pagePasses.get(page) ?? 0) + 1;
         this.pagePasses.set(page, pagePass);
         if (issues.length <= 0) {
@@ -51941,7 +51942,7 @@ class IssuesProcessor {
         if (pagePass === 1) {
             for (const issue of previouslyProcessedIssues) {
                 const issueLogger = new IssueLogger(issue);
-                issueLogger.info('           $$type skipped due being processed during the previous run');
+                issueLogger.info('           $$type skipped due to being processed during the previous run');
             }
         }
         const labelsToRemoveWhenStale = wordsToList(this.options.labelsToRemoveWhenStale);

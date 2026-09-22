@@ -150,7 +150,7 @@ describe('state', (): void => {
         .mocked(core.info)
         .mock.calls.some(call =>
           call[0].includes(
-            'issue skipped due being processed during the previous run'
+            'issue skipped due to being processed during the previous run'
           )
         )
     ).toBe(true);
