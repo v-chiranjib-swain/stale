@@ -81,6 +81,8 @@ export class IssuesProcessor {
   private readonly pagePasses = new Map<number, number>();
   private readonly waitingPageSignatures = new Map<number, string>();
   private readonly firstPassFetchCounts = new Map<number, number>();
+  private readonly waitPasses = new Map<number, number>();
+  private readonly reorderFlagged = new Map<number, boolean>();
 
   constructor(options: IIssuesProcessorOptions, state: IState) {
     this.options = options;
@@ -139,6 +141,8 @@ export class IssuesProcessor {
       this.pagePasses.clear();
       this.waitingPageSignatures.clear();
       this.firstPassFetchCounts.clear();
+      this.waitPasses.clear();
+      this.reorderFlagged.clear();
 
       return this.operations.getRemainingOperationsCount();
     }
@@ -160,9 +164,7 @@ export class IssuesProcessor {
       }
     }
 
-    // A previous-run skip is only detectable on a page's first fetch this run;
-    // later passes re-see the same items because we're waiting on GitHub, not because of restored state.
-    // silent retries (no new items, not the first fetch) stay fully quiet to avoid no-op noise
+    // avoid repeat "processing page" noise on no-op retries; always log the first fetch
     const isVisiblePass = unprocessedIssues.length > 0 || pagePass === 1;
     if (isVisiblePass) {
       this._logger.info(
@@ -260,9 +262,7 @@ export class IssuesProcessor {
       .filter(issue => closedIssueNumbers.has(issue.number))
       .map(issue => issue.number);
     const pageContainsClosedIssue = visibleClosedIssueNumbers.length > 0;
-    // sort-by "updated"/"comments" can reorder the collection when a stale
-    // comment/label mutation is applied, even though nothing closed; re-check
-    // this page once more before advancing so shifted items aren't skipped
+    // mutable sort keys (updated/comments) can reorder the list with no closures at all
     const sortKeyIsMutable =
       this.options.sortBy === 'updated' || this.options.sortBy === 'comments';
     const pageMayHaveReordered =
@@ -273,12 +273,44 @@ export class IssuesProcessor {
       this.waitingPageSignatures.get(page) !== waitingPageSignature;
     this.waitingPageSignatures.set(page, waitingPageSignature);
 
-    const backoffMilliseconds = Math.min(500 * 2 ** (pagePass - 1), 5000);
+    // this pass's own closes are trivially still visible in the pre-close fetch; only wait once a later fetch reconfirms persistence
+    const freshClosureThisPass =
+      pageContainsClosedIssue && closedItemsCount > 0;
+    const shouldWaitForClosure =
+      pageContainsClosedIssue && closedItemsCount === 0;
 
-    if (
-      pageContainsClosedIssue &&
-      (closedItemsCount > 0 || waitingPageChanged)
-    ) {
+    // reorder is only ever detected "fresh"; only wait once it's flagged on two consecutive passes
+    const reorderPersisting =
+      pageMayHaveReordered && this.reorderFlagged.get(page) === true;
+    this.reorderFlagged.set(page, pageMayHaveReordered);
+
+    // a fresh closure always wins the immediate, no-wait re-check, even if this pass also looks reordered
+    const shouldWait =
+      !freshClosureThisPass && (shouldWaitForClosure || reorderPersisting);
+
+    // counter only advances on passes that actually wait, so free re-checks don't skip ahead in the backoff sequence
+    if (shouldWait) {
+      this.waitPasses.set(page, (this.waitPasses.get(page) ?? 0) + 1);
+    } else {
+      this.waitPasses.delete(page);
+    }
+    const backoffMilliseconds = Math.min(
+      500 * 2 ** ((this.waitPasses.get(page) ?? 1) - 1),
+      5000
+    );
+
+    if (pageContainsClosedIssue && closedItemsCount > 0) {
+      // presence here is expected (checked against the pre-close snapshot), not evidence GitHub is behind
+      this._logger.info(
+        `${LoggerService.yellow(
+          `${closedItemsCount} item${
+            closedItemsCount === 1 ? '' : 's'
+          } just closed on page `
+        )} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow(
+          '. Re-checking this page immediately to confirm GitHub reflects it.'
+        )}`
+      );
+    } else if (pageContainsClosedIssue && waitingPageChanged) {
       this._logger.info(
         `${LoggerService.yellow(
           `${visibleClosedIssueNumbers.length} previously closed item${
@@ -288,7 +320,7 @@ export class IssuesProcessor {
           `. Waiting ${backoffMilliseconds}ms for GitHub to catch up with closures.`
         )}`
       );
-    } else if (pageMayHaveReordered) {
+    } else if (reorderPersisting) {
       this._logger.info(
         `${LoggerService.yellow(
           'Items were just processed on page '
@@ -296,14 +328,23 @@ export class IssuesProcessor {
           `, which can reorder results when sorting by "${this.options.sortBy}". Waiting ${backoffMilliseconds}ms to re-check this page.`
         )}`
       );
+    } else if (pageMayHaveReordered) {
+      this._logger.info(
+        `${LoggerService.yellow(
+          'Items were just processed on page '
+        )} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow(
+          `, which can reorder results when sorting by "${this.options.sortBy}". Re-checking this page immediately to confirm GitHub reflects it.`
+        )}`
+      );
     }
 
-    if (pageIsUnstable && !this.options.debugOnly) {
+    if (shouldWait && !this.options.debugOnly) {
       await this.wait(backoffMilliseconds);
     }
 
     if (!pageIsUnstable) {
       this.waitingPageSignatures.delete(page);
+      this.reorderFlagged.delete(page);
       this._logger.info(
         `${LoggerService.green('Page ')} ${LoggerService.cyan(
           `#${page}`

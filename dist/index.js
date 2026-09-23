@@ -51874,6 +51874,8 @@ class IssuesProcessor {
     pagePasses = new Map();
     waitingPageSignatures = new Map();
     firstPassFetchCounts = new Map();
+    waitPasses = new Map();
+    reorderFlagged = new Map();
     constructor(options, state) {
         this.options = options;
         this.state = state;
@@ -51913,6 +51915,8 @@ class IssuesProcessor {
             this.pagePasses.clear();
             this.waitingPageSignatures.clear();
             this.firstPassFetchCounts.clear();
+            this.waitPasses.clear();
+            this.reorderFlagged.clear();
             return this.operations.getRemainingOperationsCount();
         }
         if (pagePass === 1) {
@@ -51929,9 +51933,7 @@ class IssuesProcessor {
                 unprocessedIssues.push(issue);
             }
         }
-        // A previous-run skip is only detectable on a page's first fetch this run;
-        // later passes re-see the same items because we're waiting on GitHub, not because of restored state.
-        // silent retries (no new items, not the first fetch) stay fully quiet to avoid no-op noise
+        // avoid repeat "processing page" noise on no-op retries; always log the first fetch
         const isVisiblePass = unprocessedIssues.length > 0 || pagePass === 1;
         if (isVisiblePass) {
             this._logger.info(`${LoggerService.yellow('Processing page ')} ${LoggerService.cyan(`#${page}`)} ${LoggerService.yellow(': ')} ${LoggerService.cyan(unprocessedIssues.length)} ${LoggerService.yellow(`new item${unprocessedIssues.length === 1 ? '' : 's'} out of `)} ${LoggerService.cyan(issues.length)} ${LoggerService.yellow(`fetched (${previouslyProcessedIssues.length} previously processed)...`)}`);
@@ -51976,28 +51978,48 @@ class IssuesProcessor {
             .filter(issue => closedIssueNumbers.has(issue.number))
             .map(issue => issue.number);
         const pageContainsClosedIssue = visibleClosedIssueNumbers.length > 0;
-        // sort-by "updated"/"comments" can reorder the collection when a stale
-        // comment/label mutation is applied, even though nothing closed; re-check
-        // this page once more before advancing so shifted items aren't skipped
+        // mutable sort keys (updated/comments) can reorder the list with no closures at all
         const sortKeyIsMutable = this.options.sortBy === 'updated' || this.options.sortBy === 'comments';
         const pageMayHaveReordered = sortKeyIsMutable && unprocessedIssues.length > 0;
         const pageIsUnstable = pageContainsClosedIssue || pageMayHaveReordered;
         const waitingPageSignature = visibleClosedIssueNumbers.join(',');
         const waitingPageChanged = this.waitingPageSignatures.get(page) !== waitingPageSignature;
         this.waitingPageSignatures.set(page, waitingPageSignature);
-        const backoffMilliseconds = Math.min(500 * 2 ** (pagePass - 1), 5000);
-        if (pageContainsClosedIssue &&
-            (closedItemsCount > 0 || waitingPageChanged)) {
+        // this pass's own closes are trivially still visible in the pre-close fetch; only wait once a later fetch reconfirms persistence
+        const freshClosureThisPass = pageContainsClosedIssue && closedItemsCount > 0;
+        const shouldWaitForClosure = pageContainsClosedIssue && closedItemsCount === 0;
+        // reorder is only ever detected "fresh"; only wait once it's flagged on two consecutive passes
+        const reorderPersisting = pageMayHaveReordered && this.reorderFlagged.get(page) === true;
+        this.reorderFlagged.set(page, pageMayHaveReordered);
+        // a fresh closure always wins the immediate, no-wait re-check, even if this pass also looks reordered
+        const shouldWait = !freshClosureThisPass && (shouldWaitForClosure || reorderPersisting);
+        // counter only advances on passes that actually wait, so free re-checks don't skip ahead in the backoff sequence
+        if (shouldWait) {
+            this.waitPasses.set(page, (this.waitPasses.get(page) ?? 0) + 1);
+        }
+        else {
+            this.waitPasses.delete(page);
+        }
+        const backoffMilliseconds = Math.min(500 * 2 ** ((this.waitPasses.get(page) ?? 1) - 1), 5000);
+        if (pageContainsClosedIssue && closedItemsCount > 0) {
+            // presence here is expected (checked against the pre-close snapshot), not evidence GitHub is behind
+            this._logger.info(`${LoggerService.yellow(`${closedItemsCount} item${closedItemsCount === 1 ? '' : 's'} just closed on page `)} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow('. Re-checking this page immediately to confirm GitHub reflects it.')}`);
+        }
+        else if (pageContainsClosedIssue && waitingPageChanged) {
             this._logger.info(`${LoggerService.yellow(`${visibleClosedIssueNumbers.length} previously closed item${visibleClosedIssueNumbers.length === 1 ? '' : 's'} still visible on page `)} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow(`. Waiting ${backoffMilliseconds}ms for GitHub to catch up with closures.`)}`);
         }
-        else if (pageMayHaveReordered) {
+        else if (reorderPersisting) {
             this._logger.info(`${LoggerService.yellow('Items were just processed on page ')} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow(`, which can reorder results when sorting by "${this.options.sortBy}". Waiting ${backoffMilliseconds}ms to re-check this page.`)}`);
         }
-        if (pageIsUnstable && !this.options.debugOnly) {
+        else if (pageMayHaveReordered) {
+            this._logger.info(`${LoggerService.yellow('Items were just processed on page ')} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow(`, which can reorder results when sorting by "${this.options.sortBy}". Re-checking this page immediately to confirm GitHub reflects it.`)}`);
+        }
+        if (shouldWait && !this.options.debugOnly) {
             await this.wait(backoffMilliseconds);
         }
         if (!pageIsUnstable) {
             this.waitingPageSignatures.delete(page);
+            this.reorderFlagged.delete(page);
             this._logger.info(`${LoggerService.green('Page ')} ${LoggerService.cyan(`#${page}`)} ${LoggerService.green(' is stable. Advancing to page ')} ${LoggerService.cyan(`#${page + 1}`)}${LoggerService.green('.')}`);
         }
         return this.processIssues(pageIsUnstable ? page : page + 1);
