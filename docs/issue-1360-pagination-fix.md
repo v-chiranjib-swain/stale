@@ -434,7 +434,482 @@ cases. Not significant enough to warrant a README change; captured here instead.
 
 ---
 
-## 9. Conclusion
+## 9. PR Review: Sort-By Reordering (Copilot)
+
+GitHub's automated PR reviewer flagged a second, **distinct** bug on PR #25: when
+`sort-by` is `updated` or `comments`, marking an item stale (adding a comment, changing
+its `updated_at`) can shift the paginated ordering itself — independent of any
+closures. The original fix only re-checked a page when a **closure** was detected; a
+pure reorder with zero closures would still blindly advance to `page + 1` and skip
+whatever shifted into the already-consumed range.
+
+**Investigation:** confirmed real and reproducible locally. Live reproduction on
+`stale-labeler-test` was attempted repeatedly but abandoned as infeasible — GitHub's
+own sort index for `sort=comments`/`sort=updated` appears to have its own
+eventual-consistency lag, separate from the closure-reflection lag, so a fast CI run
+can outrun the reorder before it becomes observable. The local, deterministic tests
+were accepted as sufficient proof for this bug class.
+
+**Fix:** a new `pageMayHaveReordered` check, gated on the sort key being mutable and
+at least one new item having been processed this pass:
+
+```ts
+const sortKeyIsMutable =
+  this.options.sortBy === 'updated' || this.options.sortBy === 'comments';
+const pageMayHaveReordered =
+  sortKeyIsMutable && unprocessedIssues.length > 0;
+const pageIsUnstable = pageContainsClosedIssue || pageMayHaveReordered;
+```
+
+**Regression tests** (`__tests__/pagination.spec.ts`):
+- `processes items shifted into an earlier page by comment-based reordering`
+- `does not skip items when marking stale changes the updated-sorted list`
+
+Sample log (comment-based reorder, no closures):
+
+```text
+Processing page  #1 :  5 new items out of  5 fetched (0 previously processed)...
+Page  #1  processed.
+Items were just processed on page  #1, which can reorder results when sorting by
+"comments". Re-checking this page immediately to confirm GitHub reflects it.
+Processing page  #1 :  2 new items out of  5 fetched (3 previously processed)...
+Page  #1  processed.
+Page  #1  is stable. Advancing to page  #2.
+```
+
+---
+
+## 10. PR Review: `debugOnly` Wait Skip (Copilot)
+
+Flagged concern: in `debugOnly` mode, `_closeIssue()`/`_markStale()` still perform
+their local bookkeeping (populating `closedIssues`, tracking processed items) even
+though the real GitHub API write is skipped. This meant `pageContainsClosedIssue`/
+`pageMayHaveReordered` could still evaluate `true` in debug mode, triggering a real
+`wait()` delay that serves no purpose — nothing on GitHub's side ever changes in
+debug mode, so there's nothing to wait for.
+
+**Investigation:** confirmed valid. The literal suggested fix (skip the retry
+decision entirely in `debugOnly`) broke two pre-existing tests that rely on
+`debugOnly: true` to simulate closures without mocking the real API. **Narrower fix
+applied instead:** only the actual `wait()` call is skipped in debug mode; the
+same-page retry decision (`pageIsUnstable`) is unchanged, so debug output still
+shows every page revisit, just without the artificial delay:
+
+```ts
+if (shouldWait && !this.options.debugOnly) {
+  await this.wait(backoffMilliseconds);
+}
+```
+
+**Regression test:** `does not wait in debugOnly mode even when a closure appears to
+persist` — confirms zero `wait()` calls in debug mode (the run also short-circuits
+earlier than in production mode, via the pre-existing `pageSignature` fast-forward
+described in §11).
+
+**Live validation:** baseline dry-run timestamps showed 1s+ of wasted delay per stale
+page before this fix; none after.
+
+---
+
+## 11. PR Review: `pageSignature` Dead Code (Copilot)
+
+Flagged concern: `pageSignature` (a debug-only fast-forward signature) was computed
+and stored on **every** call to `processIssues()`, but only ever read inside the
+`debugOnly` branch. In production mode this was pure wasted work on every page fetch.
+
+**Investigation:** confirmed 100% valid via exhaustive `grep` — `pageSignatures` is
+never referenced outside the `debugOnly` block. **Fix:** gated the entire
+computation/storage inside `if (this.options.debugOnly) { ... }`, exactly as
+suggested. Pure cleanup, zero behavior change — all 30 suites / 1368 tests passed
+unchanged immediately after this commit.
+
+```ts
+if (this.options.debugOnly) {
+  const pageSignature = issues.map(issue => issue.number).join(',');
+  if (this.pageSignatures.get(page) === pageSignature) {
+    return this.processIssues(page + 1);
+  }
+  this.pageSignatures.set(page, pageSignature);
+}
+```
+
+---
+
+## 12. PR Review: Unnecessary Backoff Before First Same-Page Retry (Copilot)
+
+Flagged concern: the very first same-page re-fetch after closing an item **already**
+incurred a `wait()` delay, even though nothing had actually confirmed GitHub was
+behind yet — the closed item's presence on that first re-check is trivially expected
+(it's checked against the pre-close fetch snapshot), not real evidence of lag.
+
+**Fix, part 1 — skip the wait on a fresh closure:**
+
+```ts
+const freshClosureThisPass = pageContainsClosedIssue && closedItemsCount > 0;
+const shouldWaitForClosure = pageContainsClosedIssue && closedItemsCount === 0;
+```
+
+A wait is now only triggered once a **subsequent** fetch reconfirms the same closed
+item(s) are still visible (`closedItemsCount === 0` — nothing new closed *this*
+pass, yet the item is still there).
+
+**Fix, part 2 — decouple the backoff counter from raw fetch attempts.** The first
+implementation reused the raw per-page fetch counter (`pagePass`) to compute the
+backoff duration, which meant the "free" immediate re-check still consumed a slot in
+the exponential sequence — the first *real* wait came out as `1000ms` instead of
+`500ms`. A dedicated `waitPasses` counter was introduced that only increments on
+passes that actually wait, and resets whenever a fresh closure/reorder-free stable
+page is reached:
+
+```ts
+private readonly waitPasses = new Map<number, number>();
+...
+if (shouldWait) {
+  this.waitPasses.set(page, (this.waitPasses.get(page) ?? 0) + 1);
+} else {
+  this.waitPasses.delete(page);
+}
+const backoffMilliseconds = Math.min(
+  500 * 2 ** ((this.waitPasses.get(page) ?? 1) - 1),
+  5000
+);
+```
+
+**Regression tests:**
+- `re-fetches a page immediately after a closure, with no wait, if GitHub already
+  reflects it` — zero waits when the immediate re-check already shows stability.
+- `waits only once a fresh re-fetch still shows the closed item persisting` — a
+  single `500ms` wait, only after persistence is reconfirmed.
+- `waits for repeated stale pages without processing items twice` — updated
+  `waitCalls` expectation from `[1000, 2000, 4000, 5000]` to `[500, 1000, 2000,
+  4000]`, confirming the backoff sequence now always starts at `500ms`.
+
+Sample log (closure confirmed still visible on the fresh re-fetch):
+
+```text
+Processing page  #1 :  4 new items out of  10 fetched (0 previously processed)...
+[#4] Closing pull request for being stale
+[#3] Closing pull request for being stale
+[#2] Closing pull request for being stale
+[#1] Closing pull request for being stale
+Page  #1  processed.
+4 items just closed on page  #1. Re-checking this page immediately to confirm
+GitHub reflects it.
+Processing page  #1 :  0 new items out of  10 fetched (10 previously processed)...
+Page  #1  processed.
+2 previously closed items still visible on page  #1. Waiting 500ms for GitHub to
+catch up with closures.
+```
+
+**Before → after:**
+
+| | Before | After |
+|---|---|---|
+| First same-page re-fetch after closing | Waited `500ms` before re-fetching | Re-fetches immediately, no wait |
+| First *confirmed-persisting* wait | `1000ms` (raw pass counter already at 2) | `500ms` (dedicated wait-only counter) |
+| Subsequent waits | `2000ms, 4000ms, 5000ms(capped)` | `1000ms, 2000ms, 4000ms, 5000ms(capped)` |
+
+---
+
+## 13. Follow-up: Closure vs. Reorder Priority on the Same Pass
+
+While validating §12 against the sort-by-reorder fix (§9), a gap was found: if a pass
+**both** closes an item fresh **and** looks reordered (`sortBy: comments`/`updated`
+with new items processed), the log printed the "just closed... re-checking
+immediately" message (implying no wait) — but the actual wait still fired, because
+`pageMayHaveReordered` unconditionally contributed to `shouldWait` regardless of the
+fresh-closure exemption. The log and the real behavior disagreed.
+
+**Fix:** a fresh closure now always wins the immediate, no-wait re-check, even if the
+same pass also looks reordered. Reordering is also no longer treated as "wait
+immediately on first detection" — like closures, it only backs off once flagged on
+two **consecutive** passes, via a new `reorderFlagged` map:
+
+```ts
+private readonly reorderFlagged = new Map<number, boolean>();
+...
+const reorderPersisting =
+  pageMayHaveReordered && this.reorderFlagged.get(page) === true;
+this.reorderFlagged.set(page, pageMayHaveReordered);
+
+const shouldWait =
+  !freshClosureThisPass && (shouldWaitForClosure || reorderPersisting);
+```
+
+**Regression tests:**
+- `re-checks a fresh closure immediately with no wait even when the same pass may
+  have reordered results` — `waitCalls: [500]`, confirming no wait on the
+  closure+reorder pass, one `500ms` wait once the re-fetch still shows the closed
+  item.
+- `re-checks a possibly-reordered page immediately, backing off only if reordering
+  persists` — `waitCalls: [500]`, confirming a pure reorder (no closure) also gets a
+  free first re-check before any backoff.
+
+Sample log (fresh closure + reorder flag both true on the same pass):
+
+```text
+Processing page  #1 :  2 new items out of  2 fetched (0 previously processed)...
+Page  #1  processed.
+1 item just closed on page  #1. Re-checking this page immediately to confirm
+GitHub reflects it.
+Page  #1  is stable. Advancing to page  #2.
+No more issues found to process. Exiting...
+```
+
+---
+
+## 14. Consolidated Scenario Reference
+
+A single walkthrough of every scenario the test suite covers, with log output in the
+action's actual format (`Processing page #N : X new item(s) out of Y fetched (Z
+previously processed)...`). This supersedes any earlier informal notes — where a
+detail below differs from an assumption made in §9–§13 (specifically: reorder no
+longer waits on first detection, see §14.5/§14.6), this section reflects the final,
+shipped behavior.
+
+### 14.1 Normal pagination — no mutation
+
+```
+Page 1 → #1 #2 #3 #4 #5
+Page 2 → #6 #7 #8 #9 #10
+```
+
+No item is closed and sorting does not change.
+
+```text
+Processing page  #1 :  5 new items out of  5 fetched (0 previously processed)...
+Page  #1  processed.
+Page  #1  is stable. Advancing to page  #2.
+Processing page  #2 :  5 new items out of  5 fetched (0 previously processed)...
+Page  #2  processed.
+Page  #2  is stable. Advancing to page  #3.
+No more issues found to process. Exiting...
+```
+
+**Expected:** page 1 → page 2 → done, no retry, no backoff.
+
+### 14.2 Closure — GitHub immediately reflects the closure
+
+`#1` is closed while processing page 1; the very next fetch already shows it gone.
+
+```text
+Processing page  #1 :  5 new items out of  5 fetched (0 previously processed)...
+[#1] Closing pull request for being stale
+Page  #1  processed.
+1 item just closed on page  #1. Re-checking this page immediately to confirm
+GitHub reflects it.
+Processing page  #1 :  0 new items out of  4 fetched (4 previously processed)...
+Page  #1  processed.
+Page  #1  is stable. Advancing to page  #2.
+```
+
+**Expected:** no `500ms` wait — the immediate re-check already proves stability.
+Covered by `re-fetches a page immediately after a closure, with no wait, if GitHub
+already reflects it`.
+
+### 14.3 Closure — GitHub is slow to reflect it
+
+`#1` is closed, but GitHub keeps returning it for two more fetches before catching up.
+
+```text
+Processing page  #1 :  5 new items out of  5 fetched (0 previously processed)...
+[#1] Closing pull request for being stale
+Page  #1  processed.
+1 item just closed on page  #1. Re-checking this page immediately to confirm
+GitHub reflects it.
+Processing page  #1 :  0 new items out of  5 fetched (4 previously processed)...
+Page  #1  processed.
+1 previously closed item still visible on page  #1. Waiting 500ms for GitHub to
+catch up with closures.
+Processing page  #1 :  0 new items out of  5 fetched (4 previously processed)...
+Page  #1  processed.
+1 previously closed item still visible on page  #1. Waiting 1000ms for GitHub to
+catch up with closures.
+Processing page  #1 :  0 new items out of  4 fetched (4 previously processed)...
+Page  #1  processed.
+Page  #1  is stable. Advancing to page  #2.
+```
+
+**Expected backoff sequence:** `500ms → 1000ms → 2000ms → 4000ms → 5000ms (capped)`.
+Covered by `waits only once a fresh re-fetch still shows the closed item persisting`
+and `waits for repeated stale pages without processing items twice`.
+
+### 14.4 Closure-induced pagination shift — the original #1360 scenario
+
+```
+Before:                              After #1-#5 close:
+Page 1 → #1 #2 #3 #4 #5              Page 1 → #6 #7 #8 #9 #10
+Page 2 → #6 #7 #8 #9 #10             Page 2 → ...
+```
+
+Without the fix, a blind `page + 1` skips `#6`-`#10` entirely — they shifted into
+page 1's range while the action had already moved on to page 2. With the fix, page 1
+is re-fetched until it stops shrinking, so every shifted item is still inspected. See
+§1 for the original live reproduction (9 PRs skipped on unfixed `main`) and §6 for the
+fixed branch's live validation (zero skips). Covered by `inspects every item when
+only some items in an earlier page close` and `processes every initially open pull
+request when earlier pages close items`.
+
+### 14.5 `sort-by: comments` — stale comments reorder the list
+
+```
+Before:                                  After #4/#5 get a stale comment:
+Page 1 → #1(0) #2(0) #3(0) #4(1) #5(1)   Page 1 → #1(0) #2(0) #3(0) #6(1) #7(2)
+Page 2 → #6(1) #7(2) #8(3) #9(4) #10(5)                          ↑        ↑
+                                                              moved from Page 2
+```
+
+Marking items stale adds a comment, which can shift the ascending-by-comments order
+enough to pull page 2 items into page 1. As of §13, a reorder-flagged page — like a
+freshly-closed one — gets one free immediate re-check before any backoff; a wait is
+only applied once reordering is flagged on two **consecutive** passes:
+
+```text
+Processing page  #1 :  5 new items out of  5 fetched (0 previously processed)...
+Page  #1  processed.
+Items were just processed on page  #1, which can reorder results when sorting by
+"comments". Re-checking this page immediately to confirm GitHub reflects it.
+Processing page  #1 :  2 new items out of  5 fetched (3 previously processed)...
+Page  #1  processed.
+Page  #1  is stable. Advancing to page  #2.
+```
+
+If the ordering keeps shifting on the immediate re-check too, the second consecutive
+flagged pass then waits:
+
+```text
+Items were just processed on page  #1, which can reorder results when sorting by
+"comments". Waiting 500ms to re-check this page.
+```
+
+**Expected:** `#6` and `#7` are inspected, not skipped. Covered by `processes items
+shifted into an earlier page by comment-based reordering` and `re-checks a
+possibly-reordered page immediately, backing off only if reordering persists`.
+
+### 14.6 `sort-by: updated` — stale operations bump `updated_at`
+
+Same mechanism as §14.5, but the mutation is `updated_at` instead of comment count:
+
+```
+Page 1 → #1 #2 #3 #4 #5     (ascending by updated_at)
+Page 2 → #6 #7 #8 #9 #10
+
+After processing page 1, #1-#5's updated_at jumps to "now":
+Page 1 → #6 #7 #8 #9 #10
+Page 2 → #1 #2 #3 #4 #5
+```
+
+```text
+Page  #1  processed.
+Items were just processed on page  #1, which can reorder results when sorting by
+"updated". Re-checking this page immediately to confirm GitHub reflects it.
+```
+
+**Expected:** no shifted item is skipped. Covered by `does not skip items when
+marking stale changes the updated-sorted list`.
+
+### 14.7 Closure + mutable sort combined
+
+`#1` closes and `#2`/`#3` mutate their sort key on the same pass — the page is
+simultaneously "just closed" and "may have reordered". The fresh closure always wins
+the immediate, no-wait re-check; the reorder condition never gets to force an
+unlogged wait on that same pass (§13 fixed this log/behavior mismatch):
+
+```text
+Processing page  #1 :  2 new items out of  2 fetched (0 previously processed)...
+Page  #1  processed.
+1 item just closed on page  #1. Re-checking this page immediately to confirm
+GitHub reflects it.
+Page  #1  is stable. Advancing to page  #2.
+No more issues found to process. Exiting...
+```
+
+Covered by `re-checks a fresh closure immediately with no wait even when the same
+pass may have reordered results`.
+
+### 14.8 `debugOnly` mode
+
+Items are inspected and logged, but no real GitHub mutation happens and no real wait
+delay is introduced, even when a closure or reorder appears to persist:
+
+```text
+1 previously closed item still visible on page  #1. Waiting 500ms for GitHub to
+catch up with closures.
+```
+
+is logged (so the intent is visible for debugging) but no actual `500ms` delay
+occurs — `wait()` is skipped entirely under `debugOnly`. Covered by `does not wait in
+debugOnly mode even when a closure appears to persist`.
+
+### 14.9 Operations-per-run exhaustion
+
+```text
+Processing page  #1 :  0 new items out of  1 fetched (1 previously processed)...
+[#1]            pull request skipped due to being processed during the previous run
+Page  #1  processed.
+1 previously closed item still visible on page  #1. Waiting 500ms for GitHub to
+catch up with closures.
+Processing page  #1 :  0 new items out of  1 fetched (1 previously processed)...
+Page  #1  processed.
+1 previously closed item still visible on page  #1. Waiting 1000ms for GitHub to
+catch up with closures.
+No more operations left! Exiting...
+If you think that not enough issues were processed you could try to increase the
+quantity related to the operations-per-run option which is currently set to 3
+```
+
+The processor stops rather than retrying indefinitely — every `getIssues()` fetch
+consumes one operation in production, including retries. Covered by `stops retrying
+a stale page when operationsPerRun is exhausted`.
+
+### 14.10 Decision flow
+
+```
+                    process page N
+                          │
+                          ▼
+              ┌───────────────────────┐
+              │ did processing close   │
+              │ or possibly reorder?   │
+              └───────────┬────────────┘
+                    No    │    Yes
+                    │     │
+                    ▼     ▼
+                 stable   same-page re-fetch (immediate, no wait)
+                    │           │
+                    │           ▼
+                    │    still unstable?
+                    │      No  │  Yes
+                    │      │   │
+                    │      ▼   ▼
+                    │   stable  wait (backoff), then re-fetch same page
+                    │      │        (only once instability is reconfirmed
+                    │      │         on a fresh, non-first-look fetch)
+                    │      │
+                    └──────┴──────► page N+1
+```
+
+### 14.11 Full regression coverage
+
+1. Normal pagination
+2. Closure + immediate GitHub consistency
+3. Closure + delayed GitHub consistency
+4. Closure-induced pagination shift (#1360)
+5. `sort-by: comments` reordering
+6. `sort-by: updated` reordering
+7. Closure + mutable sort combined
+8. `debugOnly` behavior
+9. Operations-per-run exhaustion
+
+Closure instability and sort-key instability are tracked with separate state
+(`waitingPageSignatures`/`closedIssues` vs. `reorderFlagged`), but both follow the
+same shape: an immediate, no-wait same-page re-check first, and exponential backoff
+(`500ms → 1000ms → 2000ms → 4000ms → 5000ms capped`) only once instability is
+reconfirmed on a subsequent, fresh fetch.
+
+---
+
+## 15. Conclusion
 
 - No eligible PR was skipped in any live test, across three different closure
   positions (page 1, page 3, and a full-list closure scenario).
@@ -443,12 +918,25 @@ cases. Not significant enough to warrant a README change; captured here instead.
   closures happen while a run is cut off mid-page by a low operations budget**
   (verified against both `main` and the fixed branch — see §6.5).
 - Logs are accurate, non-noisy, and self-explanatory for every scenario tested: stable
-  pages, same-page retries, shrinking pages, and cross-run resumption.
-- A PR review concern about an unbounded retry loop was investigated, confirmed to be
-  a non-issue (the existing `operations-per-run` accounting already bounds it), and
-  backed by both a new regression test and a live worst-case validation (see §8).
-- All 30 local test suites (1364 tests) pass; format, lint, and build are clean at the
-  final commit.
+  pages, same-page retries, shrinking pages, cross-run resumption, sort-by
+  reordering, and combined closure+reorder passes.
+- Beyond the original pagination-skip bug, five rounds of automated Copilot PR
+  review were investigated and resolved (§8–§13): an unbounded-retry concern
+  (confirmed a non-issue), a distinct sort-by-reordering skip bug (real, fixed), a
+  wasted `debugOnly` wait, dead `pageSignature` computation, an unnecessary backoff
+  before the first same-page retry, and a follow-up log/behavior mismatch when a
+  closure and a reorder are flagged on the same pass. Each was independently
+  verified via code tracing before any fix was applied, rather than trusting the
+  literal suggested diff.
+- §14 consolidates all nine tested scenarios (normal pagination, closure with fast
+  and slow GitHub consistency, the original #1360 pagination shift, `sort-by:
+  comments`/`updated` reordering, the closure+reorder combination, `debugOnly`, and
+  operations-per-run exhaustion) with representative logs in the action's actual
+  output format, superseding informal notes from earlier sections where behavior
+  was later refined (notably: reorder no longer waits on first detection).
+- All 30 local test suites (1373 tests) pass; format, lint, and build are clean at
+  the final commit.
+
 
 **Status: fix complete, validated locally and live. Ready for PR submission against
 upstream `actions/stale`.**
