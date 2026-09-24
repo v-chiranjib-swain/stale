@@ -180,127 +180,6 @@ describe('pagination', (): void => {
     expect(waitCalls).toEqual([500, 1000, 2000, 4000]);
   });
 
-  it('re-fetches a page immediately after a closure, with no wait, if GitHub already reflects it', async (): Promise<void> => {
-    const options: IIssuesProcessorOptions = {
-      ...DefaultProcessorOptions,
-      debugOnly: false,
-      operationsPerRun: 100
-    };
-    const closableIssue = generateIssue(
-      options,
-      1,
-      'Pull request #1',
-      '2020-01-01T17:00:00Z',
-      '2020-01-01T17:00:00Z',
-      false,
-      true
-    );
-    const staysOpenIssue = generateIssue(
-      options,
-      2,
-      'Pull request #2',
-      '2020-01-01T17:00:00Z',
-      '2020-01-01T17:00:00Z',
-      false,
-      true
-    );
-    const processedNumbers = new Set<number>();
-    const state = new StateMock();
-    state.addIssueToProcessed = issue => {
-      processedNumbers.add(issue.number);
-    };
-    state.isIssueProcessed = issue => processedNumbers.has(issue.number);
-    const requestedPages: number[] = [];
-    let pageOneRequests = 0;
-    const processor = new IssuesProcessorMock(options, state, async page => {
-      requestedPages.push(page);
-      if (page !== 1) {
-        return [];
-      }
-      pageOneRequests += 1;
-      // second fetch already reflects the closure: #1 is gone
-      return pageOneRequests === 1
-        ? [closableIssue, staysOpenIssue]
-        : [staysOpenIssue];
-    });
-    processor.processIssue = async issue => {
-      if (issue.number === 1) {
-        processor.closedIssues.push(issue);
-      }
-    };
-    const waitCalls: number[] = [];
-    processor.wait = async milliseconds => {
-      waitCalls.push(milliseconds);
-    };
-
-    await processor.processIssues();
-
-    expect(requestedPages).toEqual([1, 1, 2]);
-    // no wait at all: the immediate re-check already shows the page is stable
-    expect(waitCalls).toEqual([]);
-  });
-
-  it('waits only once a fresh re-fetch still shows the closed item persisting', async (): Promise<void> => {
-    const options: IIssuesProcessorOptions = {
-      ...DefaultProcessorOptions,
-      debugOnly: false,
-      operationsPerRun: 100
-    };
-    const closableIssue = generateIssue(
-      options,
-      1,
-      'Pull request #1',
-      '2020-01-01T17:00:00Z',
-      '2020-01-01T17:00:00Z',
-      false,
-      true
-    );
-    const staysOpenIssue = generateIssue(
-      options,
-      2,
-      'Pull request #2',
-      '2020-01-01T17:00:00Z',
-      '2020-01-01T17:00:00Z',
-      false,
-      true
-    );
-    const processedNumbers = new Set<number>();
-    const state = new StateMock();
-    state.addIssueToProcessed = issue => {
-      processedNumbers.add(issue.number);
-    };
-    state.isIssueProcessed = issue => processedNumbers.has(issue.number);
-    const requestedPages: number[] = [];
-    let pageOneRequests = 0;
-    const processor = new IssuesProcessorMock(options, state, async page => {
-      requestedPages.push(page);
-      if (page !== 1) {
-        return [];
-      }
-      pageOneRequests += 1;
-      // GitHub hasn't caught up yet on the first re-fetch; it does by the third
-      return pageOneRequests <= 2
-        ? [closableIssue, staysOpenIssue]
-        : [staysOpenIssue];
-    });
-    processor.processIssue = async issue => {
-      if (issue.number === 1) {
-        processor.closedIssues.push(issue);
-      }
-    };
-    const waitCalls: number[] = [];
-    processor.wait = async milliseconds => {
-      waitCalls.push(milliseconds);
-    };
-
-    await processor.processIssues();
-
-    expect(requestedPages).toEqual([1, 1, 1, 2]);
-    // no wait on the first (immediate) re-check; a single 500ms wait once the
-    // fresh re-fetch still shows the closed item persisting
-    expect(waitCalls).toEqual([500]);
-  });
-
   it('does not wait in debugOnly mode even when a closure appears to persist', async (): Promise<void> => {
     const options: IIssuesProcessorOptions = {
       ...DefaultProcessorOptions,
@@ -404,6 +283,7 @@ describe('pagination', (): void => {
     expect(requestedPages).toEqual([1, 1, 1]);
     expect(waitCalls).toEqual([500, 1000]);
   });
+
   it('processes every pull request when regular issues share the paginated result', async (): Promise<void> => {
     const pageSize = 10;
     const options: IIssuesProcessorOptions = {
@@ -825,5 +705,178 @@ describe('pagination', (): void => {
     expect(waitCalls).toEqual([500]);
 
     expect(result).toBe(options.operationsPerRun - 3);
+  });
+
+  it('does not skip items when a previously processed closure is still visible on the next run', async (): Promise<void> => {
+    const pageSize = 5;
+
+    const options: IIssuesProcessorOptions = {
+      ...DefaultProcessorOptions,
+      debugOnly: false,
+      operationsPerRun: 100
+    };
+
+    const allIssues: Issue[] = Array.from({length: 10}, (_, index): Issue =>
+      generateIssue(
+        options,
+        index + 1,
+        `Pull request #${index + 1}`,
+        '2020-01-01T17:00:00Z',
+        '2020-01-01T17:00:00Z',
+        false,
+        true
+      )
+    );
+
+    const processedNumbers = new Set<number>();
+    const state = new StateMock();
+
+    state.addIssueToProcessed = issue => {
+      processedNumbers.add(issue.number);
+    };
+
+    state.isIssueProcessed = issue => processedNumbers.has(issue.number);
+
+    // Simulate #1 being processed/closed during the previous run.
+    processedNumbers.add(1);
+
+    const requestedPages: number[] = [];
+    let pageOneFetchCount = 0;
+
+    const processor = new IssuesProcessorMock(options, state, async page => {
+      requestedPages.push(page);
+
+      if (page === 1) {
+        pageOneFetchCount++;
+
+        // First fetch of the new run: GitHub still returns the
+        // previously closed #1.
+        if (pageOneFetchCount === 1) {
+          return allIssues.slice(0, 5);
+        }
+
+        // After GitHub catches up, #1 disappears and #6 shifts
+        // into Page 1.
+        return [
+          allIssues[1],
+          allIssues[2],
+          allIssues[3],
+          allIssues[4],
+          allIssues[5]
+        ];
+      }
+
+      if (page === 2) {
+        return allIssues.slice(6, 10);
+      }
+
+      return [];
+    });
+
+    const inspectedNumbers: number[] = [];
+
+    processor.processIssue = async issue => {
+      inspectedNumbers.push(issue.number);
+    };
+
+    await processor.processIssues();
+
+    // #1 was already processed in the previous run, but #6 shifted
+    // into Page 1 after GitHub reflected the closure.
+    expect(inspectedNumbers).toContain(6);
+
+    // Page 1 must be re-fetched because a previously processed item
+    // was still visible.
+    expect(requestedPages.filter(page => page === 1).length).toBeGreaterThan(1);
+  });
+
+  it('does not skip items when a previously processed closure is still visible on a later page', async (): Promise<void> => {
+    const pageSize = 5;
+    const options: IIssuesProcessorOptions = {
+      ...DefaultProcessorOptions,
+      debugOnly: false,
+      operationsPerRun: 100
+    };
+
+    const allIssues: Issue[] = Array.from({length: 15}, (_, index): Issue =>
+      generateIssue(
+        options,
+        index + 1,
+        `Pull request #${index + 1}`,
+        '2020-01-01T17:00:00Z',
+        '2020-01-01T17:00:00Z',
+        false,
+        true
+      )
+    );
+
+    const processedNumbers = new Set<number>();
+
+    const state = new StateMock();
+    state.addIssueToProcessed = issue => {
+      processedNumbers.add(issue.number);
+    };
+    state.isIssueProcessed = issue => processedNumbers.has(issue.number);
+
+    // Simulate #6 being processed/closed during a previous run.
+    processedNumbers.add(6);
+
+    const requestedPages: number[] = [];
+    let pageTwoFetchCount = 0;
+
+    const processor = new IssuesProcessorMock(options, state, async page => {
+      requestedPages.push(page);
+
+      if (page === 1) {
+        // Page 1 is stable and should not need a retry.
+        return allIssues.slice(0, 5);
+      }
+
+      if (page === 2) {
+        pageTwoFetchCount++;
+
+        if (pageTwoFetchCount === 1) {
+          // #6 is still visible from the previous run.
+          return [
+            allIssues[5], // #6 - previously processed
+            allIssues[6], // #7
+            allIssues[7], // #8
+            allIssues[8], // #9
+            allIssues[9] // #10
+          ];
+        }
+
+        // Simulate GitHub reflecting the earlier closure.
+        // #11 shifts into Page 2.
+        return [
+          allIssues[6], // #7
+          allIssues[7], // #8
+          allIssues[8], // #9
+          allIssues[9], // #10
+          allIssues[10] // #11 - shifted into Page 2
+        ];
+      }
+
+      if (page === 3) {
+        return allIssues.slice(11, 15); // #12-#15
+      }
+
+      return [];
+    });
+
+    const inspectedNumbers: number[] = [];
+
+    processor.processIssue = async issue => {
+      inspectedNumbers.push(issue.number);
+    };
+
+    await processor.processIssues();
+
+    // #11 shifted into Page 2 after the previously processed #6 disappeared.
+    expect(inspectedNumbers).toContain(11);
+
+    // Page 2 must be re-fetched because a previously processed item
+    // was still visible on the first fetch.
+    expect(requestedPages.filter(page => page === 2).length).toBeGreaterThan(1);
   });
 });

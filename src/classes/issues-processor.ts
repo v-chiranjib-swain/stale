@@ -267,7 +267,13 @@ export class IssuesProcessor {
       this.options.sortBy === 'updated' || this.options.sortBy === 'comments';
     const pageMayHaveReordered =
       sortKeyIsMutable && unprocessedIssues.length > 0;
-    const pageIsUnstable = pageContainsClosedIssue || pageMayHaveReordered;
+    // Re-check pages containing restored processed items in case earlier closures shifted items.
+    const hasRestoredProcessedItems =
+      pagePass === 1 && previouslyProcessedIssues.length > 0;
+    const pageIsUnstable =
+      pageContainsClosedIssue ||
+      pageMayHaveReordered ||
+      hasRestoredProcessedItems;
     const waitingPageSignature = visibleClosedIssueNumbers.join(',');
     const waitingPageChanged =
       this.waitingPageSignatures.get(page) !== waitingPageSignature;
@@ -318,6 +324,14 @@ export class IssuesProcessor {
           } still visible on page `
         )} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow(
           `. Waiting ${backoffMilliseconds}ms for GitHub to catch up with closures.`
+        )}`
+      );
+    } else if (hasRestoredProcessedItems) {
+      this._logger.info(
+        `${LoggerService.yellow(
+          `Page `
+        )} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow(
+          ` contains previously processed item(s) from a prior run. Re-checking this page immediately in case earlier closures have shifted items.`
         )}`
       );
     } else if (reorderPersisting) {
