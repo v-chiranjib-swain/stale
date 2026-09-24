@@ -83,6 +83,14 @@ export class IssuesProcessor {
   private readonly firstPassFetchCounts = new Map<number, number>();
   private readonly waitPasses = new Map<number, number>();
   private readonly reorderFlagged = new Map<number, boolean>();
+  private readonly restoredFlagged = new Map<number, boolean>();
+  // tracks issue numbers touched during this run, to distinguish genuinely
+  // restored (prior-run) processed items from ones only processed just now
+  private readonly processedThisRunNumbers = new Set<number>();
+  // closes that failed ambiguously (network/5xx) may have still applied on
+  // GitHub's side; tracked separately from closedIssues so pagination can
+  // retry without misreporting them as confirmed in output/statistics
+  private readonly pendingCloseIssueNumbers = new Set<number>();
 
   constructor(options: IIssuesProcessorOptions, state: IState) {
     this.options = options;
@@ -115,6 +123,18 @@ export class IssuesProcessor {
     return new Promise(resolve => setTimeout(resolve, milliseconds));
   }
 
+  // a missing status means a network-level failure (timeout, reset, DNS, etc.)
+  // where the request may have reached GitHub despite the client never seeing
+  // a response; 5xx means GitHub may have applied the change before failing to
+  // respond. Neither case tells us the close definitely did NOT happen.
+  private static _isAmbiguousCloseFailure(error: unknown): boolean {
+    const status = (error as {status?: number})?.status;
+    if (status === undefined) {
+      return true;
+    }
+    return status >= 500 && status < 600;
+  }
+
   async processIssues(page: Readonly<number> = 1): Promise<number> {
     const issues: Issue[] = await this.getIssues(page);
 
@@ -143,6 +163,9 @@ export class IssuesProcessor {
       this.firstPassFetchCounts.clear();
       this.waitPasses.clear();
       this.reorderFlagged.clear();
+      this.restoredFlagged.clear();
+      this.processedThisRunNumbers.clear();
+      this.pendingCloseIssueNumbers.clear();
 
       return this.operations.getRemainingOperationsCount();
     }
@@ -207,6 +230,7 @@ export class IssuesProcessor {
       this.options.labelsToRemoveWhenUnstale
     );
     const closedItemsCountBeforePass = this.closedIssues.length;
+    const pendingCloseCountBeforePass = this.pendingCloseIssueNumbers.size;
 
     for (const issue of unprocessedIssues.values()) {
       if (!this.operations.hasRemainingOperations()) {
@@ -223,6 +247,7 @@ export class IssuesProcessor {
         );
       });
       this.state.addIssueToProcessed(issue);
+      this.processedThisRunNumbers.add(issue.number);
     }
 
     if (!this.operations.hasRemainingOperations()) {
@@ -255,9 +280,13 @@ export class IssuesProcessor {
 
     const closedItemsCount =
       this.closedIssues.length - closedItemsCountBeforePass;
-    const closedIssueNumbers = new Set(
-      this.closedIssues.map(issue => issue.number)
-    );
+    // Ambiguous closes trigger pagination retries but not confirmed-close tracking.
+    const newPendingCloseCount =
+      this.pendingCloseIssueNumbers.size - pendingCloseCountBeforePass;
+    const closedIssueNumbers = new Set([
+      ...this.closedIssues.map(issue => issue.number),
+      ...this.pendingCloseIssueNumbers
+    ]);
     const visibleClosedIssueNumbers = issues
       .filter(issue => closedIssueNumbers.has(issue.number))
       .map(issue => issue.number);
@@ -267,9 +296,11 @@ export class IssuesProcessor {
       this.options.sortBy === 'updated' || this.options.sortBy === 'comments';
     const pageMayHaveReordered =
       sortKeyIsMutable && unprocessedIssues.length > 0;
-    // Re-check pages containing restored processed items in case earlier closures shifted items.
-    const hasRestoredProcessedItems =
-      pagePass === 1 && previouslyProcessedIssues.length > 0;
+    // Restored items were processed in a previous run; items processed this run
+    // can reappear due to reordering and should not count as restored.
+    const hasRestoredProcessedItems = previouslyProcessedIssues.some(
+      issue => !this.processedThisRunNumbers.has(issue.number)
+    );
     const pageIsUnstable =
       pageContainsClosedIssue ||
       pageMayHaveReordered ||
@@ -279,20 +310,29 @@ export class IssuesProcessor {
       this.waitingPageSignatures.get(page) !== waitingPageSignature;
     this.waitingPageSignatures.set(page, waitingPageSignature);
 
-    // this pass's own closes are trivially still visible in the pre-close fetch; only wait once a later fetch reconfirms persistence
+    // this pass's own closes (confirmed or ambiguously-failed) are trivially still
+    // visible in the pre-close fetch; only wait once a later fetch reconfirms persistence
+    const freshCloseSignals = closedItemsCount + newPendingCloseCount;
     const freshClosureThisPass =
-      pageContainsClosedIssue && closedItemsCount > 0;
+      pageContainsClosedIssue && freshCloseSignals > 0;
     const shouldWaitForClosure =
-      pageContainsClosedIssue && closedItemsCount === 0;
+      pageContainsClosedIssue && freshCloseSignals === 0;
 
     // reorder is only ever detected "fresh"; only wait once it's flagged on two consecutive passes
     const reorderPersisting =
       pageMayHaveReordered && this.reorderFlagged.get(page) === true;
     this.reorderFlagged.set(page, pageMayHaveReordered);
 
+    // same free-first-check treatment as reorder: only wait once a restored item
+    // is still present on a second consecutive pass, not on every zero-delay retry
+    const restoredPersisting =
+      hasRestoredProcessedItems && this.restoredFlagged.get(page) === true;
+    this.restoredFlagged.set(page, hasRestoredProcessedItems);
+
     // a fresh closure always wins the immediate, no-wait re-check, even if this pass also looks reordered
     const shouldWait =
-      !freshClosureThisPass && (shouldWaitForClosure || reorderPersisting);
+      !freshClosureThisPass &&
+      (shouldWaitForClosure || reorderPersisting || restoredPersisting);
 
     // counter only advances on passes that actually wait, so free re-checks don't skip ahead in the backoff sequence
     if (shouldWait) {
@@ -305,13 +345,13 @@ export class IssuesProcessor {
       5000
     );
 
-    if (pageContainsClosedIssue && closedItemsCount > 0) {
+    if (pageContainsClosedIssue && freshCloseSignals > 0) {
       // presence here is expected (checked against the pre-close snapshot), not evidence GitHub is behind
       this._logger.info(
         `${LoggerService.yellow(
-          `${closedItemsCount} item${
-            closedItemsCount === 1 ? '' : 's'
-          } just closed on page `
+          `${freshCloseSignals} item${
+            freshCloseSignals === 1 ? '' : 's'
+          } may have closed on page `
         )} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow(
           '. Re-checking this page immediately to confirm GitHub reflects it.'
         )}`
@@ -324,6 +364,14 @@ export class IssuesProcessor {
           } still visible on page `
         )} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow(
           `. Waiting ${backoffMilliseconds}ms for GitHub to catch up with closures.`
+        )}`
+      );
+    } else if (hasRestoredProcessedItems && restoredPersisting) {
+      this._logger.info(
+        `${LoggerService.yellow(
+          `Page `
+        )} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow(
+          ` still contains previously processed item(s) from a prior run. Waiting ${backoffMilliseconds}ms for GitHub to catch up.`
         )}`
       );
     } else if (hasRestoredProcessedItems) {
@@ -359,6 +407,7 @@ export class IssuesProcessor {
     if (!pageIsUnstable) {
       this.waitingPageSignatures.delete(page);
       this.reorderFlagged.delete(page);
+      this.restoredFlagged.delete(page);
       this._logger.info(
         `${LoggerService.green('Page ')} ${LoggerService.cyan(
           `#${page}`
@@ -1214,6 +1263,9 @@ export class IssuesProcessor {
       this.statistics?.incrementClosedItemsCount(issue);
     } catch (error) {
       issueLogger.error(`Error when updating this $$type: ${error.message}`);
+      if (IssuesProcessor._isAmbiguousCloseFailure(error)) {
+        this.pendingCloseIssueNumbers.add(issue.number);
+      }
     }
   }
 

@@ -1,5 +1,6 @@
 import {describe, expect, it} from '@jest/globals';
 import {Issue} from '../src/classes/issue.js';
+import {IssuesProcessor} from '../src/classes/issues-processor.js';
 import {IIssuesProcessorOptions} from '../src/interfaces/issues-processor-options.js';
 import {IssuesProcessorMock} from './classes/issues-processor-mock.js';
 import {alwaysFalseStateMock, StateMock} from './classes/state-mock.js';
@@ -879,4 +880,362 @@ describe('pagination', (): void => {
     // was still visible on the first fetch.
     expect(requestedPages.filter(page => page === 2).length).toBeGreaterThan(1);
   });
+
+  it('does not skip items when a restored item disappears before the next page', async (): Promise<void> => {
+    const pageSize = 5;
+
+    const options: IIssuesProcessorOptions = {
+      ...DefaultProcessorOptions,
+      debugOnly: false,
+      operationsPerRun: 100
+    };
+
+    const allIssues: Issue[] = Array.from({length: 10}, (_, index): Issue =>
+      generateIssue(
+        options,
+        index + 1,
+        `Pull request #${index + 1}`,
+        '2020-01-01T17:00:00Z',
+        '2020-01-01T17:00:00Z',
+        false,
+        true
+      )
+    );
+
+    const processedNumbers = new Set<number>();
+
+    const state = new StateMock();
+
+    state.addIssueToProcessed = issue => {
+      processedNumbers.add(issue.number);
+    };
+
+    state.isIssueProcessed = issue => processedNumbers.has(issue.number);
+
+    // #1 was processed/closed during a previous run.
+    processedNumbers.add(1);
+
+    const requestedPages: number[] = [];
+    let pageOneFetchCount = 0;
+
+    const processor = new IssuesProcessorMock(options, state, async page => {
+      requestedPages.push(page);
+
+      if (page === 1) {
+        pageOneFetchCount++;
+
+        // Pass 1:
+        // [1, 2, 3, 4, 5]
+        if (pageOneFetchCount === 1) {
+          return allIssues.slice(0, 5);
+        }
+
+        // Pass 2 (immediate re-check after closing #2 this pass):
+        // [1, 3, 4, 5, 6]
+        //
+        // #2 has disappeared, but GitHub hasn't reflected #1's prior-run
+        // closure yet, so #1 (restored) is still visible.
+        if (pageOneFetchCount === 2) {
+          return [
+            allIssues[0], // #1 - previously processed, still visible
+            allIssues[2], // #3
+            allIssues[3], // #4
+            allIssues[4], // #5
+            allIssues[5] // #6
+          ];
+        }
+
+        // Pass 3: GitHub finally reflects #1's closure too.
+        // [3, 4, 5, 6, 7]
+        return [
+          allIssues[2], // #3
+          allIssues[3], // #4
+          allIssues[4], // #5
+          allIssues[5], // #6
+          allIssues[6] // #7 - shifted in now that #1 and #2 are both gone
+        ];
+      }
+
+      if (page === 2) {
+        // Simulate #1 disappearing before Page 2 is fetched.
+        //
+        // Current collection:
+        // [3, 4, 5, 6, 7, 8, 9, 10]
+        //
+        // Page 2 starts at offset 5, so GitHub returns:
+        // [8, 9, 10]
+        //
+        // #7 has shifted into Page 1 and would be skipped.
+        return allIssues.slice(7, 10);
+      }
+
+      return [];
+    });
+
+    const inspectedNumbers: number[] = [];
+
+    processor.processIssue = async issue => {
+      inspectedNumbers.push(issue.number);
+
+      // Simulate #2 being closed during the first pass.
+      if (issue.number === 2) {
+        processor.closedIssues.push(issue);
+      }
+    };
+
+    await processor.processIssues();
+
+    // #7 must not be skipped.
+    expect(inspectedNumbers).toContain(7);
+
+    // Page 1 should have been fetched more than once.
+    expect(requestedPages.filter(page => page === 1).length).toBeGreaterThan(1);
+  });
+
+  it('bounds retries by operationsPerRun and never double-processes items when a restored item never disappears', async (): Promise<void> => {
+    const options: IIssuesProcessorOptions = {
+      ...DefaultProcessorOptions,
+      debugOnly: false,
+      operationsPerRun: 12
+    };
+
+    const allIssues: Issue[] = Array.from({length: 8}, (_, index): Issue =>
+      generateIssue(
+        options,
+        index + 1,
+        `Pull request #${index + 1}`,
+        '2020-01-01T17:00:00Z',
+        '2020-01-01T17:00:00Z',
+        false,
+        true
+      )
+    );
+
+    const processedNumbers = new Set<number>();
+    const state = new StateMock();
+    state.addIssueToProcessed = issue => {
+      processedNumbers.add(issue.number);
+    };
+    state.isIssueProcessed = issue => processedNumbers.has(issue.number);
+
+    // #1 was processed/closed during a previous run, but GitHub never
+    // reflects that closure in this fixture - it stays visible forever.
+    processedNumbers.add(1);
+
+    const requestedPages: number[] = [];
+    let pageOneFetchCount = 0;
+
+    const processor = new IssuesProcessorMock(options, state, async page => {
+      requestedPages.push(page);
+      // mirrors getIssues() consuming 1 operation per fetch in production
+      processor.operations.consumeOperation();
+
+      if (page === 1) {
+        pageOneFetchCount++;
+
+        // Pass 1: [1, 2, 3, 4, 5]
+        if (pageOneFetchCount === 1) {
+          return allIssues.slice(0, 5);
+        }
+
+        // Pass 2 onward: [1, 3, 4, 5, 6] forever - #1 (restored) never
+        // disappears, simulating GitHub never reflecting the prior closure.
+        return [
+          allIssues[0], // #1 - restored, never disappears
+          allIssues[2], // #3
+          allIssues[3], // #4
+          allIssues[4], // #5
+          allIssues[5] // #6
+        ];
+      }
+
+      // Page 2 should never be reached: page 1 never stabilizes and
+      // operationsPerRun runs out first.
+      return allIssues.slice(6, 8);
+    });
+
+    const processedCounts = new Map<number, number>();
+
+    processor.processIssue = async issue => {
+      processedCounts.set(
+        issue.number,
+        (processedCounts.get(issue.number) ?? 0) + 1
+      );
+
+      // Simulate #2 being closed during the first pass.
+      if (issue.number === 2) {
+        processor.closedIssues.push(issue);
+      }
+    };
+
+    const waitCalls: number[] = [];
+    processor.wait = async milliseconds => {
+      waitCalls.push(milliseconds);
+    };
+
+    const result = await processor.processIssues();
+
+    // 1 & 2: the restored-item retries use exponential backoff, with no
+    // zero-delay waits once the restored item is confirmed to still persist
+    expect(waitCalls.slice(0, 5)).toEqual([500, 1000, 2000, 4000, 5000]);
+    expect(waitCalls.every(milliseconds => milliseconds > 0)).toBe(true);
+    expect(Math.max(...waitCalls)).toBeLessThanOrEqual(5000);
+
+    // 3: operationsPerRun provides the hard upper bound for retries,
+    // preventing the page from being retried indefinitely
+    // (page 2 is never reached as a result)
+    expect(result).toBe(0);
+    expect(requestedPages.length).toBeLessThanOrEqual(options.operationsPerRun);
+    expect(requestedPages).not.toContain(2);
+
+    // 4 & 5: exactly #2, #3, #4, #5, #6 are processed, each exactly once
+    expect([...processedCounts.keys()].sort((a, b) => a - b)).toEqual([
+      2, 3, 4, 5, 6
+    ]);
+    for (const count of processedCounts.values()) {
+      expect(count).toBe(1);
+    }
+  });
+
+  it('retries a page when a close update fails ambiguously, without reporting it as a confirmed close', async (): Promise<void> => {
+    const originalRepo = process.env.GITHUB_REPOSITORY;
+    process.env.GITHUB_REPOSITORY = 'owner/repo';
+
+    const options: IIssuesProcessorOptions = {
+      ...DefaultProcessorOptions,
+      debugOnly: false,
+      closeIssueMessage: '',
+      closePrMessage: '',
+      operationsPerRun: 100
+    };
+
+    try {
+      const allIssues: Issue[] = Array.from({length: 6}, (_, index): Issue =>
+        generateIssue(
+          options,
+          index + 1,
+          `Pull request #${index + 1}`,
+          '2020-01-01T17:00:00Z',
+          '2020-01-01T17:00:00Z',
+          false,
+          true
+        )
+      );
+
+      const state = new StateMock();
+      const processedNumbers = new Set<number>();
+      state.addIssueToProcessed = issue => {
+        processedNumbers.add(issue.number);
+      };
+      state.isIssueProcessed = issue => processedNumbers.has(issue.number);
+
+      const requestedPages: number[] = [];
+      let pageOneFetchCount = 0;
+
+      const processor = new IssuesProcessorMock(options, state, async page => {
+        requestedPages.push(page);
+        if (page !== 1) {
+          return [];
+        }
+        pageOneFetchCount++;
+        // GitHub actually applied the close despite the ambiguous client-side
+        // failure below: #2 is gone by the second fetch, and #6 has shifted
+        // into page 1's range as a result.
+        return pageOneFetchCount === 1
+          ? allIssues.slice(0, 5) // [#1, #2, #3, #4, #5]
+          : [
+              allIssues[0], // #1
+              allIssues[2], // #3
+              allIssues[3], // #4
+              allIssues[4], // #5
+              allIssues[5] // #6 - becomes visible in page 1 after #2 disappears
+            ];
+      });
+
+      // Simulate a network-level failure (no HTTP status at all) when closing
+      // #2, so the client can't tell whether GitHub applied the close.
+      (
+        processor.client.rest.issues as unknown as {
+          update: () => Promise<never>;
+        }
+      ).update = () => Promise.reject(new Error('socket hang up'));
+
+      const processedCounts = new Map<number, number>();
+
+      processor.processIssue = async issue => {
+        processedCounts.set(
+          issue.number,
+          (processedCounts.get(issue.number) ?? 0) + 1
+        );
+
+        if (issue.number === 2) {
+          await (
+            processor as unknown as {
+              _closeIssue: (issue: Issue) => Promise<void>;
+            }
+          )._closeIssue(issue);
+        }
+      };
+
+      const waitCalls: number[] = [];
+      processor.wait = async milliseconds => {
+        waitCalls.push(milliseconds);
+      };
+
+      await processor.processIssues();
+
+      // the ambiguous failure must not be reported as a confirmed close
+      expect(processor.closedIssues).toHaveLength(0);
+
+      // pagination still treats it as possibly-closed and re-checks the page
+      // immediately; the second fetch confirms it's gone, so no wait is needed
+      expect(requestedPages).toEqual([1, 1, 2]);
+      expect(waitCalls).toEqual([]);
+
+      // #6 becomes visible in page 1 once #2's ambiguous close is reflected;
+      // it must be recovered and processed exactly once, not skipped
+      expect(processedCounts.get(6)).toBe(1);
+
+      // no item is double-processed across the retry
+      expect([...processedCounts.keys()].sort((a, b) => a - b)).toEqual([
+        1, 2, 3, 4, 5, 6
+      ]);
+      for (const count of processedCounts.values()) {
+        expect(count).toBe(1);
+      }
+    } finally {
+      if (originalRepo === undefined) {
+        delete process.env.GITHUB_REPOSITORY;
+      } else {
+        process.env.GITHUB_REPOSITORY = originalRepo;
+      }
+    }
+  });
+});
+
+const isAmbiguousCloseFailure = (error: unknown): boolean =>
+  (
+    IssuesProcessor as unknown as {
+      _isAmbiguousCloseFailure: (error: unknown) => boolean;
+    }
+  )._isAmbiguousCloseFailure(error);
+
+describe('IssuesProcessor._isAmbiguousCloseFailure()', (): void => {
+  it('treats a missing status (network-level failure) as ambiguous', (): void => {
+    expect(isAmbiguousCloseFailure(new Error('socket hang up'))).toBe(true);
+  });
+
+  it.each([500, 502, 503])(
+    'treats a %i status as ambiguous',
+    (status): void => {
+      expect(isAmbiguousCloseFailure({status})).toBe(true);
+    }
+  );
+
+  it.each([400, 404, 422])(
+    'treats a %i status as not ambiguous',
+    (status): void => {
+      expect(isAmbiguousCloseFailure({status})).toBe(false);
+    }
+  );
 });
