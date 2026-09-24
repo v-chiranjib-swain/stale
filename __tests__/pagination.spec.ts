@@ -992,7 +992,7 @@ describe('pagination', (): void => {
     expect(requestedPages.filter(page => page === 1).length).toBeGreaterThan(1);
   });
 
-  it('bounds retries by operationsPerRun and never double-processes items when a restored item never disappears', async (): Promise<void> => {
+  it('stops retrying a restored item once the page stops changing, without waiting for operationsPerRun to run out', async (): Promise<void> => {
     const options: IIssuesProcessorOptions = {
       ...DefaultProcessorOptions,
       debugOnly: false,
@@ -1019,7 +1019,8 @@ describe('pagination', (): void => {
     state.isIssueProcessed = issue => processedNumbers.has(issue.number);
 
     // #1 was processed/closed during a previous run, but GitHub never
-    // reflects that closure in this fixture - it stays visible forever.
+    // reflects that closure in this fixture - it stays visible forever,
+    // as a normal previously-processed-but-still-open item would.
     processedNumbers.add(1);
 
     const requestedPages: number[] = [];
@@ -1049,9 +1050,11 @@ describe('pagination', (): void => {
         ];
       }
 
-      // Page 2 should never be reached: page 1 never stabilizes and
-      // operationsPerRun runs out first.
-      return allIssues.slice(6, 8);
+      if (page === 2) {
+        return allIssues.slice(6, 8); // #7, #8
+      }
+
+      return [];
     });
 
     const processedCounts = new Map<number, number>();
@@ -1075,22 +1078,20 @@ describe('pagination', (): void => {
 
     const result = await processor.processIssues();
 
-    // 1 & 2: the restored-item retries use exponential backoff, with no
-    // zero-delay waits once the restored item is confirmed to still persist
-    expect(waitCalls.slice(0, 5)).toEqual([500, 1000, 2000, 4000, 5000]);
-    expect(waitCalls.every(milliseconds => milliseconds > 0)).toBe(true);
-    expect(Math.max(...waitCalls)).toBeLessThanOrEqual(5000);
+    // page 1 is re-fetched while its contents are still changing (#2 closing,
+    // then #6 shifting in), but once the fetch repeats identically - #1
+    // (restored) is the only reason left - it stops retrying instead of
+    // consuming the rest of the operations budget
+    expect(requestedPages).toEqual([1, 1, 1, 2, 3]);
+    expect(waitCalls).toEqual([500]);
 
-    // 3: operationsPerRun provides the hard upper bound for retries,
-    // preventing the page from being retried indefinitely
-    // (page 2 is never reached as a result)
-    expect(result).toBe(0);
-    expect(requestedPages.length).toBeLessThanOrEqual(options.operationsPerRun);
-    expect(requestedPages).not.toContain(2);
+    // operationsPerRun was never exhausted; the run finished normally
+    expect(result).toBe(options.operationsPerRun - requestedPages.length);
 
-    // 4 & 5: exactly #2, #3, #4, #5, #6 are processed, each exactly once
+    // every item is processed exactly once, including #7/#8 on page 2,
+    // which would have been unreachable under the old operations-bound-only behavior
     expect([...processedCounts.keys()].sort((a, b) => a - b)).toEqual([
-      2, 3, 4, 5, 6
+      2, 3, 4, 5, 6, 7, 8
     ]);
     for (const count of processedCounts.values()) {
       expect(count).toBe(1);

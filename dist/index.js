@@ -51884,6 +51884,10 @@ class IssuesProcessor {
     // GitHub's side; tracked separately from closedIssues so pagination can
     // retry without misreporting them as confirmed in output/statistics
     pendingCloseIssueNumbers = new Set();
+    // raw fetched-number signature per page, used to tell a genuinely shifting
+    // page apart from one that's just repeating (a restored item that's simply
+    // still open, not evidence of a delayed closure)
+    previousFetchSignatures = new Map();
     constructor(options, state) {
         this.options = options;
         this.state = state;
@@ -51939,6 +51943,7 @@ class IssuesProcessor {
             this.restoredFlagged.clear();
             this.processedThisRunNumbers.clear();
             this.pendingCloseIssueNumbers.clear();
+            this.previousFetchSignatures.clear();
             return this.operations.getRemainingOperationsCount();
         }
         if (pagePass === 1) {
@@ -52013,9 +52018,16 @@ class IssuesProcessor {
         // Restored items were processed in a previous run; items processed this run
         // can reappear due to reordering and should not count as restored.
         const hasRestoredProcessedItems = previouslyProcessedIssues.some(issue => !this.processedThisRunNumbers.has(issue.number));
+        // a restored item alone only justifies a retry while the page's raw fetch
+        // is still changing pass-to-pass; once it repeats identically, it's a
+        // normal still-open previously-processed item, not a pending closure
+        const fetchSignature = issues.map(issue => issue.number).join(',');
+        const fetchUnchangedSincePrevious = this.previousFetchSignatures.get(page) === fetchSignature;
+        this.previousFetchSignatures.set(page, fetchSignature);
+        const restoredItemsJustifyRetry = hasRestoredProcessedItems && !fetchUnchangedSincePrevious;
         const pageIsUnstable = pageContainsClosedIssue ||
             pageMayHaveReordered ||
-            hasRestoredProcessedItems;
+            restoredItemsJustifyRetry;
         const waitingPageSignature = visibleClosedIssueNumbers.join(',');
         const waitingPageChanged = this.waitingPageSignatures.get(page) !== waitingPageSignature;
         this.waitingPageSignatures.set(page, waitingPageSignature);
@@ -52029,8 +52041,8 @@ class IssuesProcessor {
         this.reorderFlagged.set(page, pageMayHaveReordered);
         // same free-first-check treatment as reorder: only wait once a restored item
         // is still present on a second consecutive pass, not on every zero-delay retry
-        const restoredPersisting = hasRestoredProcessedItems && this.restoredFlagged.get(page) === true;
-        this.restoredFlagged.set(page, hasRestoredProcessedItems);
+        const restoredPersisting = restoredItemsJustifyRetry && this.restoredFlagged.get(page) === true;
+        this.restoredFlagged.set(page, restoredItemsJustifyRetry);
         // a fresh closure always wins the immediate, no-wait re-check, even if this pass also looks reordered
         const shouldWait = !freshClosureThisPass &&
             (shouldWaitForClosure || reorderPersisting || restoredPersisting);
@@ -52049,10 +52061,10 @@ class IssuesProcessor {
         else if (pageContainsClosedIssue && waitingPageChanged) {
             this._logger.info(`${LoggerService.yellow(`${visibleClosedIssueNumbers.length} previously closed item${visibleClosedIssueNumbers.length === 1 ? '' : 's'} still visible on page `)} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow(`. Waiting ${backoffMilliseconds}ms for GitHub to catch up with closures.`)}`);
         }
-        else if (hasRestoredProcessedItems && restoredPersisting) {
+        else if (restoredItemsJustifyRetry && restoredPersisting) {
             this._logger.info(`${LoggerService.yellow(`Page `)} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow(` still contains previously processed item(s) from a prior run. Waiting ${backoffMilliseconds}ms for GitHub to catch up.`)}`);
         }
-        else if (hasRestoredProcessedItems) {
+        else if (restoredItemsJustifyRetry) {
             this._logger.info(`${LoggerService.yellow(`Page `)} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow(` contains previously processed item(s) from a prior run. Re-checking this page immediately in case earlier closures have shifted items.`)}`);
         }
         else if (reorderPersisting) {
