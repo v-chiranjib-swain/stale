@@ -51970,6 +51970,9 @@ class IssuesProcessor {
         }
         if (pagePass === 1) {
             for (const issue of previouslyProcessedIssues) {
+                if (this.processedThisRunNumbers.has(issue.number)) {
+                    continue;
+                }
                 const issueLogger = new IssueLogger(issue);
                 issueLogger.info('           $$type skipped due to being processed during the previous run');
             }

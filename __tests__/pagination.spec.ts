@@ -1,6 +1,7 @@
-import {describe, expect, it} from '@jest/globals';
+import {jest, describe, expect, it} from '@jest/globals';
 import {Issue} from '../src/classes/issue.js';
 import {IssuesProcessor} from '../src/classes/issues-processor.js';
+import {IssueLogger} from '../src/classes/loggers/issue-logger.js';
 import {IIssuesProcessorOptions} from '../src/interfaces/issues-processor-options.js';
 import {IssuesProcessorMock} from './classes/issues-processor-mock.js';
 import {alwaysFalseStateMock, StateMock} from './classes/state-mock.js';
@@ -443,6 +444,88 @@ describe('pagination', (): void => {
 
     // No item was closed; the ordering changed only because comments changed.
     expect(processor.closedIssues).toHaveLength(0);
+  });
+
+  it('does not report an item shifted within this run as skipped from the previous run', async (): Promise<void> => {
+    const pageSize = 5;
+
+    const options: IIssuesProcessorOptions = {
+      ...DefaultProcessorOptions,
+      sortBy: 'comments',
+      ascending: true,
+      debugOnly: false,
+      operationsPerRun: 100
+    };
+
+    const allIssues: Issue[] = Array.from({length: 10}, (_, index): Issue =>
+      generateIssue(
+        options,
+        index + 1,
+        `Pull request #${index + 1}`,
+        '2020-01-01T17:00:00Z',
+        '2020-01-01T17:00:00Z',
+        false,
+        true
+      )
+    );
+
+    // #1 was genuinely processed/closed during a previous run.
+    const processedNumbers = new Set<number>([1]);
+    const state = new StateMock();
+    state.addIssueToProcessed = issue => {
+      processedNumbers.add(issue.number);
+    };
+    state.isIssueProcessed = issue => processedNumbers.has(issue.number);
+
+    const commentCounts = new Map<number, number>(
+      allIssues.map(issue => [issue.number, 0])
+    );
+
+    const processor = new IssuesProcessorMock(options, state, async page => {
+      const sorted = [...allIssues].sort((a, b) => {
+        const diff =
+          (commentCounts.get(a.number) ?? 0) -
+          (commentCounts.get(b.number) ?? 0);
+        return diff !== 0 ? diff : a.number - b.number;
+      });
+      const pageStart = (page - 1) * pageSize;
+      return sorted.slice(pageStart, pageStart + pageSize);
+    });
+
+    processor.processIssue = async issue => {
+      // simulate every processed item getting a stale comment, which
+      // reorders the ascending-by-comments list and shifts items forward
+      commentCounts.set(
+        issue.number,
+        (commentCounts.get(issue.number) ?? 0) + 1
+      );
+    };
+
+    const skippedNumbers: number[] = [];
+    const infoSpy = jest
+      .spyOn(IssueLogger.prototype, 'info')
+      .mockImplementation(function (this: unknown, ...message: string[]) {
+        if (
+          message
+            .join(' ')
+            .includes('skipped due to being processed during the previous run')
+        ) {
+          skippedNumbers.push(
+            (this as unknown as {_issue: Issue})._issue.number
+          );
+        }
+      });
+
+    await processor.processIssues();
+
+    infoSpy.mockRestore();
+
+    // #1 is genuinely restored from a previous run and must still be reported
+    expect(skippedNumbers).toContain(1);
+
+    // no item that was only processed earlier in this same run (and then
+    // shifted pages via reordering) should be misreported as a previous-run skip
+    expect(skippedNumbers.filter(number => number !== 1)).toHaveLength(0);
   });
 
   it('does not skip items when marking stale changes the updated-sorted list', async (): Promise<void> => {
