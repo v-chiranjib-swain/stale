@@ -91,10 +91,14 @@ export class IssuesProcessor {
   // GitHub's side; tracked separately from closedIssues so pagination can
   // retry without misreporting them as confirmed in output/statistics
   private readonly pendingCloseIssueNumbers = new Set<number>();
-  // raw fetched-number signature per page, used to tell a genuinely shifting
-  // page apart from one that's just repeating (a restored item that's simply
-  // still open, not evidence of a delayed closure)
-  private readonly previousFetchSignatures = new Map<number, string>();
+  // a repeated fetch alone isn't proof a closure has finished propagating, so
+  // restored items get a bounded number of backed-off retries (matching the
+  // 500/1000/2000/4000/5000 ladder) before giving up, rather than a single check
+  private readonly restoredRetryCounts = new Map<number, number>();
+  private static readonly MAX_RESTORED_ITEM_RETRIES = 5;
+  // set only when this pass actually performed a mutation that can affect a
+  // mutable sort key (see _markStale); unprocessedIssues alone doesn't imply that
+  private sortAffectingMutationThisPass = false;
 
   constructor(options: IIssuesProcessorOptions, state: IState) {
     this.options = options;
@@ -170,7 +174,7 @@ export class IssuesProcessor {
       this.restoredFlagged.clear();
       this.processedThisRunNumbers.clear();
       this.pendingCloseIssueNumbers.clear();
-      this.previousFetchSignatures.clear();
+      this.restoredRetryCounts.clear();
 
       return this.operations.getRemainingOperationsCount();
     }
@@ -239,6 +243,7 @@ export class IssuesProcessor {
     );
     const closedItemsCountBeforePass = this.closedIssues.length;
     const pendingCloseCountBeforePass = this.pendingCloseIssueNumbers.size;
+    this.sortAffectingMutationThisPass = false;
 
     for (const issue of unprocessedIssues.values()) {
       if (!this.operations.hasRemainingOperations()) {
@@ -299,25 +304,34 @@ export class IssuesProcessor {
       .filter(issue => closedIssueNumbers.has(issue.number))
       .map(issue => issue.number);
     const pageContainsClosedIssue = visibleClosedIssueNumbers.length > 0;
-    // mutable sort keys (updated/comments) can reorder the list with no closures at all
+    // mutable sort keys (updated/comments) can reorder the list, but only if this
+    // pass actually mutated one (see sortAffectingMutationThisPass); merely having
+    // unprocessed items doesn't mean anything changed (e.g. fresh/exempt items)
     const sortKeyIsMutable =
       this.options.sortBy === 'updated' || this.options.sortBy === 'comments';
     const pageMayHaveReordered =
-      sortKeyIsMutable && unprocessedIssues.length > 0;
+      sortKeyIsMutable && this.sortAffectingMutationThisPass;
     // Restored items were processed in a previous run; items processed this run
     // can reappear due to reordering and should not count as restored.
     const hasRestoredProcessedItems = previouslyProcessedIssues.some(
       issue => !this.processedThisRunNumbers.has(issue.number)
     );
-    // a restored item alone only justifies a retry while the page's raw fetch
-    // is still changing pass-to-pass; once it repeats identically, it's a
-    // normal still-open previously-processed item, not a pending closure
-    const fetchSignature = issues.map(issue => issue.number).join(',');
-    const fetchUnchangedSincePrevious =
-      this.previousFetchSignatures.get(page) === fetchSignature;
-    this.previousFetchSignatures.set(page, fetchSignature);
+    // a single repeated fetch isn't proof a prior-run closure has finished
+    // propagating - it can coincidentally repeat once mid-propagation - so
+    // restored items get a bounded number of backed-off retries instead
+    const restoredRetryCount = this.restoredRetryCounts.get(page) ?? 0;
     const restoredItemsJustifyRetry =
-      hasRestoredProcessedItems && !fetchUnchangedSincePrevious;
+      hasRestoredProcessedItems &&
+      restoredRetryCount < IssuesProcessor.MAX_RESTORED_ITEM_RETRIES;
+    if (hasRestoredProcessedItems) {
+      this.restoredRetryCounts.set(page, restoredRetryCount + 1);
+    } else {
+      this.restoredRetryCounts.delete(page);
+    }
+    // the retry window ran out, but the restored item is still visible - the
+    // page is being advanced past despite this, not because it's confirmed stable
+    const restoredRetryWindowExpired =
+      hasRestoredProcessedItems && !restoredItemsJustifyRetry;
     const pageIsUnstable =
       pageContainsClosedIssue ||
       pageMayHaveReordered ||
@@ -425,6 +439,15 @@ export class IssuesProcessor {
       this.waitingPageSignatures.delete(page);
       this.reorderFlagged.delete(page);
       this.restoredFlagged.delete(page);
+      if (restoredRetryWindowExpired) {
+        this._logger.warning(
+          `${LoggerService.yellowBright(
+            `Page `
+          )} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellowBright(
+            ` still contains previously processed item(s) from a prior run after ${IssuesProcessor.MAX_RESTORED_ITEM_RETRIES} retries. Advancing anyway - if items were skipped, a future run will pick them up once GitHub reflects the change.`
+          )}`
+        );
+      }
       this._logger.info(
         `${LoggerService.green('Page ')} ${LoggerService.cyan(
           `#${page}`
@@ -1173,6 +1196,10 @@ export class IssuesProcessor {
 
     issueLogger.info(`Marking this $$type as stale`);
     this.staleIssues.push(issue);
+    // only a stale-transition actually mutates a mutable sort key (updated_at
+    // below, and comment count if a message is posted); fresh/exempt/already
+    // -stale passes don't reach here and must not be treated as reordering
+    this.sortAffectingMutationThisPass = true;
 
     // if the issue is being marked stale, the updated date should be changed to right now
     // so that close calculations work correctly

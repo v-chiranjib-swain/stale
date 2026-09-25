@@ -2,6 +2,7 @@ import {jest, describe, expect, it} from '@jest/globals';
 import {Issue} from '../src/classes/issue.js';
 import {IssuesProcessor} from '../src/classes/issues-processor.js';
 import {IssueLogger} from '../src/classes/loggers/issue-logger.js';
+import {Logger} from '../src/classes/loggers/logger.js';
 import {IIssuesProcessorOptions} from '../src/interfaces/issues-processor-options.js';
 import {IssuesProcessorMock} from './classes/issues-processor-mock.js';
 import {alwaysFalseStateMock, StateMock} from './classes/state-mock.js';
@@ -425,6 +426,10 @@ describe('pagination', (): void => {
           issue.number,
           (commentCounts.get(issue.number) ?? 0) + 1
         );
+        // this test bypasses the real _markStale(), so flag the mutation manually
+        (
+          processor as unknown as {sortAffectingMutationThisPass: boolean}
+        ).sortAffectingMutationThisPass = true;
       }
     };
 
@@ -592,6 +597,10 @@ describe('pagination', (): void => {
       // The issue remains open; nothing is added to closedIssues.
       if (issue.number <= 5) {
         updatedRank.set(issue.number, issue.number + 100);
+        // this test bypasses the real _markStale(), so flag the mutation manually
+        (
+          processor as unknown as {sortAffectingMutationThisPass: boolean}
+        ).sortAffectingMutationThisPass = true;
       }
     };
 
@@ -653,7 +662,12 @@ describe('pagination', (): void => {
       // reorder-worthy mutation; nothing new shifts in after that
       return pageOneRequests === 1 ? [issue1] : [issue1, issue2];
     });
-    processor.processIssue = async () => {};
+    processor.processIssue = async () => {
+      // this test bypasses the real _markStale(), so flag the mutation manually
+      (
+        processor as unknown as {sortAffectingMutationThisPass: boolean}
+      ).sortAffectingMutationThisPass = true;
+    };
     const waitCalls: number[] = [];
     processor.wait = async milliseconds => {
       waitCalls.push(milliseconds);
@@ -1162,13 +1176,14 @@ describe('pagination', (): void => {
     const result = await processor.processIssues();
 
     // page 1 is re-fetched while its contents are still changing (#2 closing,
-    // then #6 shifting in), but once the fetch repeats identically - #1
-    // (restored) is the only reason left - it stops retrying instead of
-    // consuming the rest of the operations budget
-    expect(requestedPages).toEqual([1, 1, 1, 2, 3]);
-    expect(waitCalls).toEqual([500]);
+    // then #6 shifting in), then keeps retrying with growing backoff for a
+    // bounded number of passes while #1 (restored) is the only reason left,
+    // rather than stopping the instant a single fetch happens to repeat
+    expect(requestedPages).toEqual([1, 1, 1, 1, 1, 1, 2, 3]);
+    expect(waitCalls).toEqual([500, 1000, 2000, 4000]);
 
     // operationsPerRun was never exhausted; the run finished normally
+    // once the bounded restored-item retry window elapsed
     expect(result).toBe(options.operationsPerRun - requestedPages.length);
 
     // every item is processed exactly once, including #7/#8 on page 2,
@@ -1179,6 +1194,208 @@ describe('pagination', (): void => {
     for (const count of processedCounts.values()) {
       expect(count).toBe(1);
     }
+  });
+
+  it('does not skip an item shifted after two identical stale responses while a restored closure is still propagating', async (): Promise<void> => {
+    const options: IIssuesProcessorOptions = {
+      ...DefaultProcessorOptions,
+      debugOnly: false,
+      operationsPerRun: 100
+    };
+
+    const allIssues: Issue[] = Array.from({length: 6}, (_, index): Issue =>
+      generateIssue(
+        options,
+        index + 1,
+        `Pull request #${index + 1}`,
+        '2020-01-01T17:00:00Z',
+        '2020-01-01T17:00:00Z',
+        false,
+        true
+      )
+    );
+
+    const processedNumbers = new Set<number>();
+    const state = new StateMock();
+    state.addIssueToProcessed = issue => {
+      processedNumbers.add(issue.number);
+    };
+    state.isIssueProcessed = issue => processedNumbers.has(issue.number);
+
+    // #1 was processed/closed during a previous run.
+    processedNumbers.add(1);
+
+    const requestedPages: number[] = [];
+    let pageOneFetchCount = 0;
+
+    const processor = new IssuesProcessorMock(options, state, async page => {
+      requestedPages.push(page);
+
+      if (page !== 1) {
+        return [];
+      }
+
+      pageOneFetchCount++;
+
+      // Pass 1 and pass 2 return the exact same snapshot - GitHub hasn't
+      // even started reflecting #1's prior-run closure yet, so an identical
+      // repeat is not proof that nothing will ever change.
+      if (pageOneFetchCount <= 2) {
+        return allIssues.slice(0, 5); // [#1, #2, #3, #4, #5]
+      }
+
+      // Pass 3: GitHub finally reflects #1's closure, and #6 shifts in.
+      return [
+        allIssues[1], // #2
+        allIssues[2], // #3
+        allIssues[3], // #4
+        allIssues[4], // #5
+        allIssues[5] // #6 - shifted in now that #1 is gone
+      ];
+    });
+
+    const processedCounts = new Map<number, number>();
+
+    processor.processIssue = async issue => {
+      processedCounts.set(
+        issue.number,
+        (processedCounts.get(issue.number) ?? 0) + 1
+      );
+    };
+
+    const waitCalls: number[] = [];
+    processor.wait = async milliseconds => {
+      waitCalls.push(milliseconds);
+    };
+
+    await processor.processIssues();
+
+    // #6 must not be skipped just because pass 1 and pass 2 looked identical.
+    expect(processedCounts.get(6)).toBe(1);
+
+    // the first pass gets a free immediate re-check; only the second
+    // identical pass actually waits before the third, differing, fetch
+    expect(requestedPages).toEqual([1, 1, 1, 2]);
+    expect(waitCalls).toEqual([500]);
+
+    // every item is processed exactly once
+    for (const count of processedCounts.values()) {
+      expect(count).toBe(1);
+    }
+  });
+
+  it('logs a distinct warning when the restored-item retry window expires while the item is still visible', async (): Promise<void> => {
+    const options: IIssuesProcessorOptions = {
+      ...DefaultProcessorOptions,
+      debugOnly: false,
+      operationsPerRun: 100
+    };
+
+    // #1 was processed/closed during a previous run, but GitHub never
+    // reflects that closure in this fixture - it stays visible forever.
+    const processedNumbers = new Set<number>([1]);
+    const state = new StateMock();
+    state.addIssueToProcessed = issue => {
+      processedNumbers.add(issue.number);
+    };
+    state.isIssueProcessed = issue => processedNumbers.has(issue.number);
+
+    const closableIssue = generateIssue(
+      options,
+      1,
+      'Pull request #1',
+      '2020-01-01T17:00:00Z',
+      '2020-01-01T17:00:00Z',
+      false,
+      true
+    );
+
+    const processor = new IssuesProcessorMock(options, state, async page =>
+      page === 1 ? [closableIssue] : []
+    );
+    processor.processIssue = async () => {};
+
+    const warnSpy = jest
+      .spyOn(Logger.prototype, 'warning')
+      .mockImplementation(() => {});
+
+    await processor.processIssues();
+
+    const expiredWarnings = warnSpy.mock.calls.filter(call =>
+      call
+        .join(' ')
+        .includes(
+          `still contains previously processed item(s) from a prior run after`
+        )
+    );
+
+    warnSpy.mockRestore();
+
+    // the retry window (5 bounded retries) expires while #1 is still
+    // visible; this must be logged distinctly from a genuinely stable page
+    expect(expiredWarnings).toHaveLength(1);
+  });
+
+  it('does not log the retry-window-expired warning when a restored item resolves before the window expires', async (): Promise<void> => {
+    const options: IIssuesProcessorOptions = {
+      ...DefaultProcessorOptions,
+      debugOnly: false,
+      operationsPerRun: 100
+    };
+
+    const allIssues: Issue[] = Array.from({length: 6}, (_, index): Issue =>
+      generateIssue(
+        options,
+        index + 1,
+        `Pull request #${index + 1}`,
+        '2020-01-01T17:00:00Z',
+        '2020-01-01T17:00:00Z',
+        false,
+        true
+      )
+    );
+
+    // #1 was processed/closed during a previous run.
+    const processedNumbers = new Set<number>([1]);
+    const state = new StateMock();
+    state.addIssueToProcessed = issue => {
+      processedNumbers.add(issue.number);
+    };
+    state.isIssueProcessed = issue => processedNumbers.has(issue.number);
+
+    let pageOneFetchCount = 0;
+
+    const processor = new IssuesProcessorMock(options, state, async page => {
+      if (page !== 1) {
+        return [];
+      }
+
+      pageOneFetchCount++;
+
+      // #1 resolves (disappears) well within the 5-retry bound.
+      return pageOneFetchCount === 1
+        ? allIssues.slice(0, 5) // [#1, #2, #3, #4, #5]
+        : allIssues.slice(1, 6); // [#2, #3, #4, #5, #6]
+    });
+    processor.processIssue = async () => {};
+
+    const warnSpy = jest
+      .spyOn(Logger.prototype, 'warning')
+      .mockImplementation(() => {});
+
+    await processor.processIssues();
+
+    const expiredWarnings = warnSpy.mock.calls.filter(call =>
+      call
+        .join(' ')
+        .includes(
+          `still contains previously processed item(s) from a prior run after`
+        )
+    );
+
+    warnSpy.mockRestore();
+
+    expect(expiredWarnings).toHaveLength(0);
   });
 
   it('retries a page when a close update fails ambiguously, without reporting it as a confirmed close', async (): Promise<void> => {
