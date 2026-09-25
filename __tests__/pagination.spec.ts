@@ -115,7 +115,7 @@ describe('pagination', (): void => {
     expect(requestedPages).toEqual([1, 1, 2, 3]);
   });
 
-  it('waits for repeated stale pages without processing items twice', async (): Promise<void> => {
+  it('retries stale pages until closures are reflected without processing items twice', async (): Promise<void> => {
     const options: IIssuesProcessorOptions = {
       ...DefaultProcessorOptions,
       debugOnly: false,
@@ -173,8 +173,10 @@ describe('pagination', (): void => {
 
     expect(inspectedNumbers).toEqual(pullRequests.map(issue => issue.number));
     expect(requestedPages).toEqual([1, 1, 1, 1, 1, 1, 2]);
-    // backoff increases between retries of the same unchanged page, capped at 5000ms
-    expect(waitCalls).toEqual([500, 1000, 2000, 4000, 5000]);
+    // The first re-check happens immediately after the closures.
+    // Backoff starts once a fresh fetch confirms the same closed items
+    // are still visible, then increases on each further retry.
+    expect(waitCalls).toEqual([500, 1000, 2000, 4000]);
   });
 
   it('stops retrying a stale page when operationsPerRun is exhausted', async () => {
@@ -220,6 +222,7 @@ describe('pagination', (): void => {
     expect(requestedPages).toEqual([1, 1, 1]);
     expect(waitCalls).toEqual([500, 1000]);
   });
+
   it('processes every pull request when regular issues share the paginated result', async (): Promise<void> => {
     const pageSize = 10;
     const options: IIssuesProcessorOptions = {
@@ -281,5 +284,102 @@ describe('pagination', (): void => {
     expect(processor.closedIssues.map(issue => issue.number)).toEqual(
       pullRequests.map(issue => issue.number)
     );
+  });
+
+  it('processes items shifted into an earlier page by comment-based reordering', async (): Promise<void> => {
+    const pageSize = 5;
+
+    const options: IIssuesProcessorOptions = {
+      ...DefaultProcessorOptions,
+      sortBy: 'comments',
+      ascending: true,
+      debugOnly: false,
+      operationsPerRun: 100
+    };
+
+    const allIssues: Issue[] = Array.from({length: 10}, (_, index): Issue =>
+      generateIssue(
+        options,
+        index + 1,
+        `Pull request #${index + 1}`,
+        '2020-01-01T17:00:00Z',
+        '2020-01-01T17:00:00Z',
+        false,
+        true
+      )
+    );
+
+    // Initial ordering:
+    // Page 1 -> #1(0) #2(0) #3(0) #4(1) #5(1)
+    // Page 2 -> #6(1) #7(2) #8(3) #9(4) #10(5)
+    const commentCounts = new Map<number, number>([
+      [1, 0],
+      [2, 0],
+      [3, 0],
+      [4, 1],
+      [5, 1],
+      [6, 1],
+      [7, 2],
+      [8, 3],
+      [9, 4],
+      [10, 5]
+    ]);
+
+    const inspectedNumbers: number[] = [];
+    const requestedPages: number[] = [];
+
+    const state = new StateMock();
+    const processedNumbers = new Set<number>();
+
+    state.addIssueToProcessed = issue => {
+      processedNumbers.add(issue.number);
+    };
+
+    state.isIssueProcessed = issue => processedNumbers.has(issue.number);
+
+    const processor = new IssuesProcessorMock(options, state, async page => {
+      requestedPages.push(page);
+
+      const sorted = [...allIssues].sort((a, b) => {
+        const diff =
+          (commentCounts.get(a.number) ?? 0) -
+          (commentCounts.get(b.number) ?? 0);
+
+        return diff !== 0 ? diff : a.number - b.number;
+      });
+
+      const pageStart = (page - 1) * pageSize;
+
+      return sorted.slice(pageStart, pageStart + pageSize);
+    });
+
+    processor.processIssue = async issue => {
+      inspectedNumbers.push(issue.number);
+
+      // Simulate marking #4 and #5 stale by adding a comment.
+      if (issue.number === 4 || issue.number === 5) {
+        commentCounts.set(
+          issue.number,
+          (commentCounts.get(issue.number) ?? 0) + 1
+        );
+      }
+    };
+
+    await processor.processIssues();
+
+    // After processing Page 1:
+    // Page 1 -> #1(0) #2(0) #3(0) #6(1) #7(2)
+    //                         ↑       ↑
+    //                     moved from Page 2
+
+    expect(inspectedNumbers.slice().sort((a, b) => a - b)).toEqual(
+      allIssues.map(issue => issue.number)
+    );
+
+    expect(requestedPages).toContain(1);
+    expect(requestedPages).toContain(2);
+
+    // No item was closed; the ordering changed only because comments changed.
+    expect(processor.closedIssues).toHaveLength(0);
   });
 });

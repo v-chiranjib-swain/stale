@@ -51873,8 +51873,8 @@ class IssuesProcessor {
     state;
     pageSignatures = new Map();
     pagePasses = new Map();
-    waitingPageSignatures = new Map();
     firstPassFetchCounts = new Map();
+    waitPasses = new Map();
     constructor(options, state) {
         this.options = options;
         this.state = state;
@@ -51911,8 +51911,8 @@ class IssuesProcessor {
             this.state.reset();
             this.pageSignatures.clear();
             this.pagePasses.clear();
-            this.waitingPageSignatures.clear();
             this.firstPassFetchCounts.clear();
+            this.waitPasses.clear();
             return this.operations.getRemainingOperationsCount();
         }
         if (pagePass === 1) {
@@ -51931,7 +51931,7 @@ class IssuesProcessor {
         }
         // A previous-run skip is only detectable on a page's first fetch this run;
         // later passes re-see the same items because we're waiting on GitHub, not because of restored state.
-        // silent retries (no new items, not the first fetch) stay fully quiet to avoid no-op noise
+        // Show processing logs on the first fetch or when new items are found.
         const isVisiblePass = unprocessedIssues.length > 0 || pagePass === 1;
         if (isVisiblePass) {
             this._logger.info(`${LoggerService.yellow('Processing page ')} ${LoggerService.cyan(`#${page}`)} ${LoggerService.yellow(': ')} ${LoggerService.cyan(unprocessedIssues.length)} ${LoggerService.yellow(`new item${unprocessedIssues.length === 1 ? '' : 's'} out of `)} ${LoggerService.cyan(issues.length)} ${LoggerService.yellow(`fetched (${previouslyProcessedIssues.length} previously processed)...`)}`);
@@ -51976,22 +51976,41 @@ class IssuesProcessor {
             .filter(issue => closedIssueNumbers.has(issue.number))
             .map(issue => issue.number);
         const pageContainsClosedIssue = visibleClosedIssueNumbers.length > 0;
-        const waitingPageSignature = visibleClosedIssueNumbers.join(',');
-        const waitingPageChanged = this.waitingPageSignatures.get(page) !== waitingPageSignature;
-        this.waitingPageSignatures.set(page, waitingPageSignature);
-        const backoffMilliseconds = Math.min(500 * 2 ** (pagePass - 1), 5000);
-        if (pageContainsClosedIssue &&
-            (closedItemsCount > 0 || waitingPageChanged)) {
+        // updated/comments sort order can shift once items are processed
+        const sortKeyIsMutable = this.options.sortBy === 'updated' || this.options.sortBy === 'comments';
+        const pageMayHaveReordered = sortKeyIsMutable && unprocessedIssues.length > 0;
+        const pageIsUnstable = pageContainsClosedIssue || pageMayHaveReordered;
+        // closes from this pass are freshly re-checked with no wait; only back
+        // off once a later fetch reconfirms the same closed item still persists
+        const shouldWaitForClosure = pageContainsClosedIssue && closedItemsCount === 0;
+        const wasWaitingForClosure = (this.waitPasses.get(page) ?? 0) > 0;
+        if (shouldWaitForClosure) {
+            this.waitPasses.set(page, (this.waitPasses.get(page) ?? 0) + 1);
+        }
+        else {
+            this.waitPasses.delete(page);
+        }
+        const retryNumber = this.waitPasses.get(page) ?? 0;
+        const backoffMilliseconds = Math.min(500 * 2 ** (retryNumber - 1), 5000);
+        if (pageContainsClosedIssue && closedItemsCount > 0) {
+            this._logger.info(`${LoggerService.yellow(`${closedItemsCount} item${closedItemsCount === 1 ? '' : 's'} just closed on page `)} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow('. Re-checking this page immediately to confirm GitHub reflects it.')}`);
+        }
+        else if (shouldWaitForClosure) {
             this._logger.info(`${LoggerService.yellow(`${visibleClosedIssueNumbers.length} previously closed item${visibleClosedIssueNumbers.length === 1 ? '' : 's'} still visible on page `)} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow(`. Waiting ${backoffMilliseconds}ms for GitHub to catch up with closures.`)}`);
         }
-        if (pageContainsClosedIssue) {
+        else if (wasWaitingForClosure) {
+            this._logger.info(`${LoggerService.green('GitHub now reflects the closures on page ')} ${LoggerService.cyan(`#${page}`)}${LoggerService.green('.')}`);
+        }
+        else if (pageMayHaveReordered) {
+            this._logger.info(`${LoggerService.yellow('Items were just processed on page ')} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow(`, which can reorder results when sorting by "${this.options.sortBy}". Re-checking this page immediately to confirm GitHub reflects it.`)}`);
+        }
+        if (shouldWaitForClosure) {
             await this.wait(backoffMilliseconds);
         }
-        if (!pageContainsClosedIssue) {
-            this.waitingPageSignatures.delete(page);
+        if (!pageIsUnstable) {
             this._logger.info(`${LoggerService.green('Page ')} ${LoggerService.cyan(`#${page}`)} ${LoggerService.green(' is stable. Advancing to page ')} ${LoggerService.cyan(`#${page + 1}`)}${LoggerService.green('.')}`);
         }
-        return this.processIssues(pageContainsClosedIssue ? page : page + 1);
+        return this.processIssues(pageIsUnstable ? page : page + 1);
     }
     async processIssue(issue, labelsToAddWhenUnstale, labelsToRemoveWhenUnstale, labelsToRemoveWhenStale) {
         this.statistics?.incrementProcessedItemsCount(issue);
