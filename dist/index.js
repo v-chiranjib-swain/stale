@@ -52238,7 +52238,7 @@ class IssuesProcessor {
             return Promise.resolve([]);
         }
     }
-    // grab issues from github in batches of 100
+    // grab issues from github in batches of 10 (reduced for live pagination-1360 testing)
     async getIssues(page) {
         try {
             this.operations.consumeOperation();
@@ -52246,7 +52246,7 @@ class IssuesProcessor {
                 owner: github_context.repo.owner,
                 repo: github_context.repo.repo,
                 state: 'open',
-                per_page: 100,
+                per_page: 10,
                 direction: this.options.ascending ? 'asc' : 'desc',
                 sort: getSortField(this.options.sortBy),
                 page
