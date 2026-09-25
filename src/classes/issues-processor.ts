@@ -77,6 +77,28 @@ export class IssuesProcessor {
   readonly statistics: Statistics | undefined;
   private readonly _logger: Logger = new Logger();
   private readonly state: IState;
+  private readonly pageSignatures = new Map<number, string>();
+  private readonly pagePasses = new Map<number, number>();
+  private readonly waitingPageSignatures = new Map<number, string>();
+  private readonly firstPassFetchCounts = new Map<number, number>();
+  private readonly waitPasses = new Map<number, number>();
+  private readonly reorderFlagged = new Map<number, boolean>();
+  private readonly restoredFlagged = new Map<number, boolean>();
+  // tracks issue numbers touched during this run, to distinguish genuinely
+  // restored (prior-run) processed items from ones only processed just now
+  private readonly processedThisRunNumbers = new Set<number>();
+  // closes that failed ambiguously (network/5xx) may have still applied on
+  // GitHub's side; tracked separately from closedIssues so pagination can
+  // retry without misreporting them as confirmed in output/statistics
+  private readonly pendingCloseIssueNumbers = new Set<number>();
+  // a repeated fetch alone isn't proof a closure has finished propagating, so
+  // restored items get a bounded number of backed-off retries (matching the
+  // 500/1000/2000/4000/5000 ladder) before giving up, rather than a single check
+  private readonly restoredRetryCounts = new Map<number, number>();
+  private static readonly MAX_RESTORED_ITEM_RETRIES = 5;
+  // set only when this pass actually performed a mutation that can affect a
+  // mutable sort key (see _markStale); unprocessedIssues alone doesn't imply that
+  private sortAffectingMutationThisPass = false;
 
   constructor(options: IIssuesProcessorOptions, state: IState) {
     this.options = options;
@@ -104,9 +126,35 @@ export class IssuesProcessor {
     }
   }
 
+  // overridable so tests don't incur real delays
+  async wait(milliseconds: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, milliseconds));
+  }
+
+  // a missing status means a network-level failure (timeout, reset, DNS, etc.)
+  // where the request may have reached GitHub despite the client never seeing
+  // a response; 5xx means GitHub may have applied the change before failing to
+  // respond. Neither case tells us the close definitely did NOT happen.
+  private static _isAmbiguousCloseFailure(error: unknown): boolean {
+    const status = (error as {status?: number})?.status;
+    if (status === undefined) {
+      return true;
+    }
+    return status >= 500 && status < 600;
+  }
+
   async processIssues(page: Readonly<number> = 1): Promise<number> {
-    // get the next batch of issues
     const issues: Issue[] = await this.getIssues(page);
+
+    if (this.options.debugOnly) {
+      const pageSignature = issues.map(issue => issue.number).join(',');
+      if (this.pageSignatures.get(page) === pageSignature) {
+        return this.processIssues(page + 1);
+      }
+      this.pageSignatures.set(page, pageSignature);
+    }
+    const pagePass = (this.pagePasses.get(page) ?? 0) + 1;
+    this.pagePasses.set(page, pagePass);
 
     if (issues.length <= 0) {
       this._logger.info(
@@ -117,18 +165,70 @@ export class IssuesProcessor {
         .logStats();
 
       this.state.reset();
+      this.pageSignatures.clear();
+      this.pagePasses.clear();
+      this.waitingPageSignatures.clear();
+      this.firstPassFetchCounts.clear();
+      this.waitPasses.clear();
+      this.reorderFlagged.clear();
+      this.restoredFlagged.clear();
+      this.processedThisRunNumbers.clear();
+      this.pendingCloseIssueNumbers.clear();
+      this.restoredRetryCounts.clear();
 
       return this.operations.getRemainingOperationsCount();
-    } else {
+    }
+
+    if (pagePass === 1) {
+      this.firstPassFetchCounts.set(page, issues.length);
+    }
+    const fetchCountShrank =
+      issues.length < (this.firstPassFetchCounts.get(page) ?? issues.length);
+
+    const unprocessedIssues: Issue[] = [];
+    const previouslyProcessedIssues: Issue[] = [];
+
+    for (const issue of issues) {
+      if (this.state.isIssueProcessed(issue)) {
+        previouslyProcessedIssues.push(issue);
+      } else {
+        unprocessedIssues.push(issue);
+      }
+    }
+
+    // avoid repeat "processing page" noise on no-op retries; always log the first fetch
+    const isVisiblePass = unprocessedIssues.length > 0 || pagePass === 1;
+    if (isVisiblePass) {
       this._logger.info(
         `${LoggerService.yellow(
-          'Processing the batch of issues '
+          'Processing page '
         )} ${LoggerService.cyan(`#${page}`)} ${LoggerService.yellow(
-          ' containing '
+          ': '
+        )} ${LoggerService.cyan(unprocessedIssues.length)} ${LoggerService.yellow(
+          `new item${unprocessedIssues.length === 1 ? '' : 's'} out of `
         )} ${LoggerService.cyan(issues.length)} ${LoggerService.yellow(
-          ` issue${issues.length > 1 ? 's' : ''}...`
+          `fetched (${previouslyProcessedIssues.length} previously processed)...`
         )}`
       );
+      if (fetchCountShrank) {
+        this._logger.info(
+          `${LoggerService.green('Page ')} ${LoggerService.cyan(
+            `#${page}`
+          )} ${LoggerService.green(' shrank as GitHub reflected the closures.')}`
+        );
+      }
+    }
+
+    if (pagePass === 1) {
+      for (const issue of previouslyProcessedIssues) {
+        if (this.processedThisRunNumbers.has(issue.number)) {
+          continue;
+        }
+        const issueLogger: IssueLogger = new IssueLogger(issue);
+        issueLogger.info(
+          '           $$type skipped due to being processed during the previous run'
+        );
+      }
     }
 
     const labelsToRemoveWhenStale: string[] = wordsToList(
@@ -141,20 +241,16 @@ export class IssuesProcessor {
     const labelsToRemoveWhenUnstale: string[] = wordsToList(
       this.options.labelsToRemoveWhenUnstale
     );
+    const closedItemsCountBeforePass = this.closedIssues.length;
+    const pendingCloseCountBeforePass = this.pendingCloseIssueNumbers.size;
+    this.sortAffectingMutationThisPass = false;
 
-    for (const issue of issues.values()) {
-      // Stop the processing if no more operations remains
+    for (const issue of unprocessedIssues.values()) {
       if (!this.operations.hasRemainingOperations()) {
         break;
       }
 
       const issueLogger: IssueLogger = new IssueLogger(issue);
-      if (this.state.isIssueProcessed(issue)) {
-        issueLogger.info(
-          '           $$type skipped due being processed during the previous run'
-        );
-        continue;
-      }
       await issueLogger.grouping(`$$type #${issue.number}`, async () => {
         await this.processIssue(
           issue,
@@ -164,6 +260,7 @@ export class IssuesProcessor {
         );
       });
       this.state.addIssueToProcessed(issue);
+      this.processedThisRunNumbers.add(issue.number);
     }
 
     if (!this.operations.hasRemainingOperations()) {
@@ -186,14 +283,181 @@ export class IssuesProcessor {
       return 0;
     }
 
-    this._logger.info(
-      `${LoggerService.green('Batch ')} ${LoggerService.cyan(
-        `#${page}`
-      )} ${LoggerService.green(' processed.')}`
+    if (isVisiblePass) {
+      this._logger.info(
+        `${LoggerService.green('Page ')} ${LoggerService.cyan(
+          `#${page}`
+        )} ${LoggerService.green(' processed.')}`
+      );
+    }
+
+    const closedItemsCount =
+      this.closedIssues.length - closedItemsCountBeforePass;
+    // Ambiguous closes trigger pagination retries but not confirmed-close tracking.
+    const newPendingCloseCount =
+      this.pendingCloseIssueNumbers.size - pendingCloseCountBeforePass;
+    const closedIssueNumbers = new Set([
+      ...this.closedIssues.map(issue => issue.number),
+      ...this.pendingCloseIssueNumbers
+    ]);
+    const visibleClosedIssueNumbers = issues
+      .filter(issue => closedIssueNumbers.has(issue.number))
+      .map(issue => issue.number);
+    const pageContainsClosedIssue = visibleClosedIssueNumbers.length > 0;
+    // mutable sort keys (updated/comments) can reorder the list, but only if this
+    // pass actually mutated one (see sortAffectingMutationThisPass); merely having
+    // unprocessed items doesn't mean anything changed (e.g. fresh/exempt items)
+    const sortKeyIsMutable =
+      this.options.sortBy === 'updated' || this.options.sortBy === 'comments';
+    const pageMayHaveReordered =
+      sortKeyIsMutable && this.sortAffectingMutationThisPass;
+    // Restored items were processed in a previous run; items processed this run
+    // can reappear due to reordering and should not count as restored.
+    const hasRestoredProcessedItems = previouslyProcessedIssues.some(
+      issue => !this.processedThisRunNumbers.has(issue.number)
+    );
+    // a single repeated fetch isn't proof a prior-run closure has finished
+    // propagating - it can coincidentally repeat once mid-propagation - so
+    // restored items get a bounded number of backed-off retries instead
+    const restoredRetryCount = this.restoredRetryCounts.get(page) ?? 0;
+    const restoredItemsJustifyRetry =
+      hasRestoredProcessedItems &&
+      restoredRetryCount < IssuesProcessor.MAX_RESTORED_ITEM_RETRIES;
+    if (hasRestoredProcessedItems) {
+      this.restoredRetryCounts.set(page, restoredRetryCount + 1);
+    } else {
+      this.restoredRetryCounts.delete(page);
+    }
+    // the retry window ran out, but the restored item is still visible - the
+    // page is being advanced past despite this, not because it's confirmed stable
+    const restoredRetryWindowExpired =
+      hasRestoredProcessedItems && !restoredItemsJustifyRetry;
+    const pageIsUnstable =
+      pageContainsClosedIssue ||
+      pageMayHaveReordered ||
+      restoredItemsJustifyRetry;
+    const waitingPageSignature = visibleClosedIssueNumbers.join(',');
+    const waitingPageChanged =
+      this.waitingPageSignatures.get(page) !== waitingPageSignature;
+    this.waitingPageSignatures.set(page, waitingPageSignature);
+
+    // this pass's own closes (confirmed or ambiguously-failed) are trivially still
+    // visible in the pre-close fetch; only wait once a later fetch reconfirms persistence
+    const freshCloseSignals = closedItemsCount + newPendingCloseCount;
+    const freshClosureThisPass =
+      pageContainsClosedIssue && freshCloseSignals > 0;
+    const shouldWaitForClosure =
+      pageContainsClosedIssue && freshCloseSignals === 0;
+
+    // reorder is only ever detected "fresh"; only wait once it's flagged on two consecutive passes
+    const reorderPersisting =
+      pageMayHaveReordered && this.reorderFlagged.get(page) === true;
+    this.reorderFlagged.set(page, pageMayHaveReordered);
+
+    // same free-first-check treatment as reorder: only wait once a restored item
+    // is still present on a second consecutive pass, not on every zero-delay retry
+    const restoredPersisting =
+      restoredItemsJustifyRetry && this.restoredFlagged.get(page) === true;
+    this.restoredFlagged.set(page, restoredItemsJustifyRetry);
+
+    // a fresh closure always wins the immediate, no-wait re-check, even if this pass also looks reordered
+    const shouldWait =
+      !freshClosureThisPass &&
+      (shouldWaitForClosure || reorderPersisting || restoredPersisting);
+
+    // counter only advances on passes that actually wait, so free re-checks don't skip ahead in the backoff sequence
+    if (shouldWait) {
+      this.waitPasses.set(page, (this.waitPasses.get(page) ?? 0) + 1);
+    } else {
+      this.waitPasses.delete(page);
+    }
+    const backoffMilliseconds = Math.min(
+      500 * 2 ** ((this.waitPasses.get(page) ?? 1) - 1),
+      5000
     );
 
-    // Do the next batch
-    return this.processIssues(page + 1);
+    if (pageContainsClosedIssue && freshCloseSignals > 0) {
+      // presence here is expected (checked against the pre-close snapshot), not evidence GitHub is behind
+      this._logger.info(
+        `${LoggerService.yellow(
+          `${freshCloseSignals} item${
+            freshCloseSignals === 1 ? '' : 's'
+          } may have closed on page `
+        )} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow(
+          '. Re-checking this page immediately to confirm GitHub reflects it.'
+        )}`
+      );
+    } else if (pageContainsClosedIssue && waitingPageChanged) {
+      this._logger.info(
+        `${LoggerService.yellow(
+          `${visibleClosedIssueNumbers.length} previously closed item${
+            visibleClosedIssueNumbers.length === 1 ? '' : 's'
+          } still visible on page `
+        )} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow(
+          `. Waiting ${backoffMilliseconds}ms for GitHub to catch up with closures.`
+        )}`
+      );
+    } else if (restoredItemsJustifyRetry && restoredPersisting) {
+      this._logger.info(
+        `${LoggerService.yellow(
+          `Page `
+        )} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow(
+          ` still contains previously processed item(s) from a prior run. Waiting ${backoffMilliseconds}ms for GitHub to catch up.`
+        )}`
+      );
+    } else if (restoredItemsJustifyRetry) {
+      this._logger.info(
+        `${LoggerService.yellow(
+          `Page `
+        )} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow(
+          ` contains previously processed item(s) from a prior run. Re-checking this page immediately in case earlier closures have shifted items.`
+        )}`
+      );
+    } else if (reorderPersisting) {
+      this._logger.info(
+        `${LoggerService.yellow(
+          'Items were just processed on page '
+        )} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow(
+          `, which can reorder results when sorting by "${this.options.sortBy}". Waiting ${backoffMilliseconds}ms to re-check this page.`
+        )}`
+      );
+    } else if (pageMayHaveReordered) {
+      this._logger.info(
+        `${LoggerService.yellow(
+          'Items were just processed on page '
+        )} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellow(
+          `, which can reorder results when sorting by "${this.options.sortBy}". Re-checking this page immediately to confirm GitHub reflects it.`
+        )}`
+      );
+    }
+
+    if (shouldWait && !this.options.debugOnly) {
+      await this.wait(backoffMilliseconds);
+    }
+
+    if (!pageIsUnstable) {
+      this.waitingPageSignatures.delete(page);
+      this.reorderFlagged.delete(page);
+      this.restoredFlagged.delete(page);
+      if (restoredRetryWindowExpired) {
+        this._logger.warning(
+          `${LoggerService.yellowBright(
+            `Page `
+          )} ${LoggerService.cyan(`#${page}`)}${LoggerService.yellowBright(
+            ` still contains previously processed item(s) from a prior run after ${IssuesProcessor.MAX_RESTORED_ITEM_RETRIES} retries. Advancing anyway - if items were skipped, a future run will pick them up once GitHub reflects the change.`
+          )}`
+        );
+      }
+      this._logger.info(
+        `${LoggerService.green('Page ')} ${LoggerService.cyan(
+          `#${page}`
+        )} ${LoggerService.green(' is stable. Advancing to page ')} ${LoggerService.cyan(
+          `#${page + 1}`
+        )}${LoggerService.green('.')}`
+      );
+    }
+
+    return this.processIssues(pageIsUnstable ? page : page + 1);
   }
 
   async processIssue(
@@ -950,6 +1214,10 @@ export class IssuesProcessor {
 
     issueLogger.info(`Marking this $$type as stale`);
     this.staleIssues.push(issue);
+    // only a stale-transition actually mutates a mutable sort key (updated_at
+    // below, and comment count if a message is posted); fresh/exempt/already
+    // -stale passes don't reach here and must not be treated as reordering
+    this.sortAffectingMutationThisPass = true;
 
     // if the issue is being marked stale, the updated date should be changed to right now
     // so that close calculations work correctly
@@ -1001,7 +1269,6 @@ export class IssuesProcessor {
     const issueLogger: IssueLogger = new IssueLogger(issue);
 
     issueLogger.info(`Closing $$type for being stale`);
-    this.closedIssues.push(issue);
 
     if (closeMessage) {
       try {
@@ -1042,7 +1309,6 @@ export class IssuesProcessor {
 
     try {
       this._consumeIssueOperation(issue);
-      this.statistics?.incrementClosedItemsCount(issue);
 
       if (!this.options.debugOnly) {
         await this.client.rest.issues.update({
@@ -1054,8 +1320,14 @@ export class IssuesProcessor {
             'completed' | 'reopened' | 'not_planned' | null | undefined
         });
       }
+
+      this.closedIssues.push(issue);
+      this.statistics?.incrementClosedItemsCount(issue);
     } catch (error) {
       issueLogger.error(`Error when updating this $$type: ${error.message}`);
+      if (IssuesProcessor._isAmbiguousCloseFailure(error)) {
+        this.pendingCloseIssueNumbers.add(issue.number);
+      }
     }
   }
 
