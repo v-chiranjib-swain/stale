@@ -362,6 +362,11 @@ describe('pagination', (): void => {
           issue.number,
           (commentCounts.get(issue.number) ?? 0) + 1
         );
+        // this test bypasses the real _markStale/_removeLabel/_addLabelsWhenUnstale
+        // paths, so the mutation signal has to be simulated directly too
+        (
+          processor as unknown as {sortAffectingMutationThisPass: boolean}
+        ).sortAffectingMutationThisPass = true;
       }
     };
 

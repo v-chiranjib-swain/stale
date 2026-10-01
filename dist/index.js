@@ -51875,6 +51875,8 @@ class IssuesProcessor {
     pagePasses = new Map();
     firstPassFetchCounts = new Map();
     waitPasses = new Map();
+    // set by _markStale/_removeLabel/_addLabelsWhenUnstale only on a real (non-debug) mutation
+    sortAffectingMutationThisPass = false;
     constructor(options, state) {
         this.options = options;
         this.state = state;
@@ -51949,6 +51951,7 @@ class IssuesProcessor {
         const labelsToAddWhenUnstale = wordsToList(this.options.labelsToAddWhenUnstale);
         const labelsToRemoveWhenUnstale = wordsToList(this.options.labelsToRemoveWhenUnstale);
         const closedItemsCountBeforePass = this.closedIssues.length;
+        this.sortAffectingMutationThisPass = false;
         for (const issue of unprocessedIssues.values()) {
             if (!this.operations.hasRemainingOperations()) {
                 break;
@@ -51976,9 +51979,9 @@ class IssuesProcessor {
             .filter(issue => closedIssueNumbers.has(issue.number))
             .map(issue => issue.number);
         const pageContainsClosedIssue = visibleClosedIssueNumbers.length > 0;
-        // updated/comments sort order can shift once items are processed
+        // updated/comments sort order can only shift from a real stale/label mutation
         const sortKeyIsMutable = this.options.sortBy === 'updated' || this.options.sortBy === 'comments';
-        const pageMayHaveReordered = sortKeyIsMutable && unprocessedIssues.length > 0;
+        const pageMayHaveReordered = sortKeyIsMutable && this.sortAffectingMutationThisPass;
         const pageIsUnstable = pageContainsClosedIssue || pageMayHaveReordered;
         // closes from this pass are freshly re-checked with no wait; only back
         // off once a later fetch reconfirms the same closed item still persists
@@ -52251,6 +52254,8 @@ class IssuesProcessor {
                 sort: getSortField(this.options.sortBy),
                 page
             });
+            // same-page retries re-fetch and re-count the same items, so this can
+            // over-report versus the number of distinct items actually seen
             this.statistics?.incrementFetchedItemsCount(issueResult.data.length);
             return issueResult.data.map((issue) => new Issue(this.options, issue));
         }
@@ -52436,6 +52441,7 @@ class IssuesProcessor {
             try {
                 this._consumeIssueOperation(issue);
                 this.statistics?.incrementAddedItemsComment(issue);
+                this.sortAffectingMutationThisPass = true;
                 if (!this.options.debugOnly) {
                     await this.client.rest.issues.createComment({
                         owner: github_context.repo.owner,
@@ -52453,6 +52459,7 @@ class IssuesProcessor {
             this._consumeIssueOperation(issue);
             this.statistics?.incrementAddedItemsLabel(issue);
             this.statistics?.incrementStaleItemsCount(issue);
+            this.sortAffectingMutationThisPass = true;
             if (!this.options.debugOnly) {
                 await this.client.rest.issues.addLabels({
                     owner: github_context.repo.owner,
@@ -52568,6 +52575,7 @@ class IssuesProcessor {
         try {
             this._consumeIssueOperation(issue);
             this.statistics?.incrementDeletedItemsLabelsCount(issue);
+            this.sortAffectingMutationThisPass = true;
             if (!this.options.debugOnly) {
                 await this.client.rest.issues.removeLabel({
                     owner: github_context.repo.owner,
@@ -52663,6 +52671,7 @@ class IssuesProcessor {
         try {
             this._consumeIssueOperation(issue);
             this.statistics?.incrementAddedItemsLabel(issue);
+            this.sortAffectingMutationThisPass = true;
             if (!this.options.debugOnly) {
                 await this.client.rest.issues.addLabels({
                     owner: github_context.repo.owner,
