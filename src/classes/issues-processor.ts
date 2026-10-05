@@ -263,12 +263,17 @@ export class IssuesProcessor {
     const visibleClosedIssueNumbers = issues
       .filter(issue => closedIssueNumbers.has(issue.number))
       .map(issue => issue.number);
-    const pageContainsClosedIssue = visibleClosedIssueNumbers.length > 0;
+    // debug-only never mutates GitHub, so a "closed"/"mutated" item here is only
+    // a local bookkeeping artifact - retrying for it would just be a wasted fetch
+    const pageContainsClosedIssue =
+      !this.options.debugOnly && visibleClosedIssueNumbers.length > 0;
     // updated/comments sort order can only shift from a real stale/label mutation
     const sortKeyIsMutable =
       this.options.sortBy === 'updated' || this.options.sortBy === 'comments';
     const pageMayHaveReordered =
-      sortKeyIsMutable && this.sortAffectingMutationThisPass;
+      !this.options.debugOnly &&
+      sortKeyIsMutable &&
+      this.sortAffectingMutationThisPass;
     const pageIsUnstable = pageContainsClosedIssue || pageMayHaveReordered;
 
     // closes from this pass are freshly re-checked with no wait; only back
