@@ -11,6 +11,7 @@ describe('pagination', (): void => {
     const pageSize = 10;
     const options: IIssuesProcessorOptions = {
       ...DefaultProcessorOptions,
+      debugOnly: false,
       closePrMessage: '',
       daysBeforePrClose: 0,
       operationsPerRun: 100
@@ -45,11 +46,12 @@ describe('pagination', (): void => {
         const pageStart = (page - 1) * pageSize;
 
         return currentlyOpenPullRequests.slice(pageStart, pageStart + pageSize);
-      },
-      async () => [],
-      async () => '2020-01-01T17:00:00Z'
+      }
     );
     processorReference.current = processor;
+    processor.processIssue = async issue => {
+      processor.closedIssues.push(issue);
+    };
 
     await processor.processIssues();
 
@@ -62,6 +64,7 @@ describe('pagination', (): void => {
     const pageSize = 10;
     const options: IIssuesProcessorOptions = {
       ...DefaultProcessorOptions,
+      debugOnly: false,
       operationsPerRun: 100
     };
     const initiallyOpenPullRequests = Array.from(
@@ -227,6 +230,7 @@ describe('pagination', (): void => {
     const pageSize = 10;
     const options: IIssuesProcessorOptions = {
       ...DefaultProcessorOptions,
+      debugOnly: false,
       closePrMessage: '',
       daysBeforePrClose: 0,
       daysBeforeIssueStale: -1,
@@ -273,11 +277,14 @@ describe('pagination', (): void => {
         const pageStart = (page - 1) * pageSize;
 
         return currentlyOpenItems.slice(pageStart, pageStart + pageSize);
-      },
-      async () => [],
-      async () => '2020-01-01T17:00:00Z'
+      }
     );
     processorReference.current = processor;
+    processor.processIssue = async issue => {
+      if (issue.isPullRequest) {
+        processor.closedIssues.push(issue);
+      }
+    };
 
     await processor.processIssues();
 
@@ -362,6 +369,11 @@ describe('pagination', (): void => {
           issue.number,
           (commentCounts.get(issue.number) ?? 0) + 1
         );
+        // this test bypasses the real _markStale/_removeLabel/_addLabelsWhenUnstale
+        // paths, so the mutation signal has to be simulated directly too
+        (
+          processor as unknown as {sortAffectingMutationThisPass: boolean}
+        ).sortAffectingMutationThisPass = true;
       }
     };
 
@@ -381,5 +393,56 @@ describe('pagination', (): void => {
 
     // No item was closed; the ordering changed only because comments changed.
     expect(processor.closedIssues).toHaveLength(0);
+  });
+
+  it('does not retry pages for closures or reorders in debug-only mode', async (): Promise<void> => {
+    const pageSize = 10;
+    const options: IIssuesProcessorOptions = {
+      ...DefaultProcessorOptions,
+      debugOnly: true,
+      sortBy: 'comments',
+      closePrMessage: '',
+      daysBeforePrClose: 0,
+      operationsPerRun: 100
+    };
+    const allPullRequests: Issue[] = Array.from(
+      {length: 15},
+      (_, index): Issue =>
+        generateIssue(
+          options,
+          index + 1,
+          `Pull request #${index + 1}`,
+          '2020-01-01T17:00:00Z',
+          '2020-01-01T17:00:00Z',
+          false,
+          true,
+          [options.stalePrLabel]
+        )
+    );
+
+    const requestedPages: number[] = [];
+    const processor = new IssuesProcessorMock(
+      options,
+      alwaysFalseStateMock,
+      async page => {
+        requestedPages.push(page);
+        const pageStart = (page - 1) * pageSize;
+
+        // debug-only never actually closes anything, so the fetch is always
+        // the same regardless of how many passes already happened
+        return allPullRequests.slice(pageStart, pageStart + pageSize);
+      }
+    );
+    // debug-only still tracks "closed" items locally (see _closeIssue), simulated
+    // directly here since this test doesn't exercise the real staling pipeline
+    processor.processIssue = async issue => {
+      processor.closedIssues.push(issue);
+    };
+
+    await processor.processIssues();
+
+    // one fetch per page, no same-page rechecks for the debug-only "closures"/reorders
+    expect(requestedPages).toEqual([1, 2, 3]);
+    expect(processor.closedIssues).toHaveLength(15);
   });
 });

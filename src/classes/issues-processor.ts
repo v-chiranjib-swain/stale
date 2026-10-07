@@ -81,6 +81,8 @@ export class IssuesProcessor {
   private readonly pagePasses = new Map<number, number>();
   private readonly firstPassFetchCounts = new Map<number, number>();
   private readonly waitPasses = new Map<number, number>();
+  // set by _markStale/_removeLabel/_addLabelsWhenUnstale only on a real (non-debug) mutation
+  private sortAffectingMutationThisPass = false;
 
   constructor(options: IIssuesProcessorOptions, state: IState) {
     this.options = options;
@@ -206,6 +208,7 @@ export class IssuesProcessor {
       this.options.labelsToRemoveWhenUnstale
     );
     const closedItemsCountBeforePass = this.closedIssues.length;
+    this.sortAffectingMutationThisPass = false;
 
     for (const issue of unprocessedIssues.values()) {
       if (!this.operations.hasRemainingOperations()) {
@@ -260,12 +263,16 @@ export class IssuesProcessor {
     const visibleClosedIssueNumbers = issues
       .filter(issue => closedIssueNumbers.has(issue.number))
       .map(issue => issue.number);
-    const pageContainsClosedIssue = visibleClosedIssueNumbers.length > 0;
-    // updated/comments sort order can shift once items are processed
+    // debug-only never mutates GitHub; retries would just cause a wasted fetch
+    const pageContainsClosedIssue =
+      !this.options.debugOnly && visibleClosedIssueNumbers.length > 0;
+    // updated/comments sort order can only shift from a real stale/label mutation
     const sortKeyIsMutable =
       this.options.sortBy === 'updated' || this.options.sortBy === 'comments';
     const pageMayHaveReordered =
-      sortKeyIsMutable && unprocessedIssues.length > 0;
+      !this.options.debugOnly &&
+      sortKeyIsMutable &&
+      this.sortAffectingMutationThisPass;
     const pageIsUnstable = pageContainsClosedIssue || pageMayHaveReordered;
 
     // closes from this pass are freshly re-checked with no wait; only back
@@ -748,6 +755,8 @@ export class IssuesProcessor {
         sort: getSortField(this.options.sortBy),
         page
       });
+      // same-page retries re-fetch and re-count the same items, so this can
+      // over-report versus the number of distinct items actually seen
       this.statistics?.incrementFetchedItemsCount(issueResult.data.length);
 
       return issueResult.data.map(
@@ -1099,6 +1108,7 @@ export class IssuesProcessor {
       try {
         this._consumeIssueOperation(issue);
         this.statistics?.incrementAddedItemsComment(issue);
+        this.sortAffectingMutationThisPass = true;
 
         if (!this.options.debugOnly) {
           await this.client.rest.issues.createComment({
@@ -1117,6 +1127,7 @@ export class IssuesProcessor {
       this._consumeIssueOperation(issue);
       this.statistics?.incrementAddedItemsLabel(issue);
       this.statistics?.incrementStaleItemsCount(issue);
+      this.sortAffectingMutationThisPass = true;
 
       if (!this.options.debugOnly) {
         await this.client.rest.issues.addLabels({
@@ -1277,6 +1288,7 @@ export class IssuesProcessor {
     try {
       this._consumeIssueOperation(issue);
       this.statistics?.incrementDeletedItemsLabelsCount(issue);
+      this.sortAffectingMutationThisPass = true;
 
       if (!this.options.debugOnly) {
         await this.client.rest.issues.removeLabel({
@@ -1416,6 +1428,7 @@ export class IssuesProcessor {
     try {
       this._consumeIssueOperation(issue);
       this.statistics?.incrementAddedItemsLabel(issue);
+      this.sortAffectingMutationThisPass = true;
       if (!this.options.debugOnly) {
         await this.client.rest.issues.addLabels({
           owner: context.repo.owner,
